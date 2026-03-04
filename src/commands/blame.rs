@@ -1077,8 +1077,42 @@ fn overlay_ai_authorship(
                     }
                 }
             }
+        } else if let Some(tool) =
+            crate::authorship::agent_detection::match_email_to_agent(&hunk.author_email)
+        {
+            // No authorship log, but commit author email matches a known AI agent.
+            // Simulate authorship data so this commit is attributed to the agent.
+            let (simulated_log, prompt_hash) =
+                crate::authorship::agent_detection::simulate_agent_authorship(
+                    &hunk.commit_sha,
+                    tool,
+                    file_path,
+                    hunk.range.0,
+                    hunk.range.1,
+                );
+
+            // Cache the simulated log so it's included in authorship_logs output
+            commit_authorship_cache.insert(hunk.commit_sha.clone(), Some(simulated_log.clone()));
+
+            // Insert prompt record and track commits
+            if let Some(pr) = simulated_log.metadata.prompts.get(&prompt_hash) {
+                prompt_records.insert(prompt_hash.clone(), pr.clone());
+                prompt_commits
+                    .entry(prompt_hash.clone())
+                    .or_default()
+                    .insert(hunk.commit_sha.clone());
+            }
+
+            // Mark all lines in this hunk as AI-authored by the detected tool
+            for line_num in hunk.range.0..=hunk.range.1 {
+                if options.use_prompt_hashes_as_names {
+                    line_authors.insert(line_num, prompt_hash.clone());
+                } else {
+                    line_authors.insert(line_num, tool.to_string());
+                }
+            }
         } else {
-            // No authorship log for this commit
+            // No authorship log for this commit and not a known agent
             for line_num in hunk.range.0..=hunk.range.1 {
                 if options.mark_unknown {
                     // User wants explicit distinction - mark as Unknown
@@ -1313,7 +1347,12 @@ fn output_porcelain_format(
         };
 
         if let Some(hunk) = line_to_hunk.get(&line_num) {
-            let author_name = &hunk.original_author;
+            // For agent-detected commits (email matches known agent, no authorship note),
+            // override the author name with the tool name. Otherwise use git's original author.
+            let agent_tool =
+                crate::authorship::agent_detection::match_email_to_agent(&hunk.author_email);
+            let agent_name_owned = agent_tool.map(|t| t.to_string());
+            let author_name = agent_name_owned.as_deref().unwrap_or(&hunk.original_author);
             let commit_sha = &hunk.commit_sha;
             let author_email = &hunk.author_email;
             let author_time = hunk.author_time;
@@ -1438,8 +1477,12 @@ fn output_incremental_format(
     let mut seen_commits: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line_num in requested_lines {
         if let Some(hunk) = line_to_hunk.get(&line_num) {
-            // For incremental format, use the original git author, not AI authorship
-            let author_name = &hunk.original_author;
+            // For agent-detected commits (email matches known agent, no authorship note),
+            // override the author name with the tool name. Otherwise use git's original author.
+            let agent_tool =
+                crate::authorship::agent_detection::match_email_to_agent(&hunk.author_email);
+            let agent_name_owned = agent_tool.map(|t| t.to_string());
+            let author_name = agent_name_owned.as_deref().unwrap_or(&hunk.original_author);
             let commit_sha = &hunk.commit_sha;
             let author_email = &hunk.author_email;
             let author_time = hunk.author_time;
