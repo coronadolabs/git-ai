@@ -392,6 +392,7 @@ impl Repository {
             BlameAnalysisResult,
             Vec<AuthorshipLog>,
             HashMap<String, Vec<String>>,
+            std::collections::HashSet<String>, // commits with real authorship notes
         ),
         GitAiError,
     > {
@@ -399,7 +400,7 @@ impl Repository {
         let blame_hunks = self.blame_hunks_for_ranges(relative_file_path, line_ranges, options)?;
 
         // Step 2: Overlay AI authorship information.
-        let (line_authors, prompt_records, authorship_logs, prompt_commits) =
+        let (line_authors, prompt_records, authorship_logs, prompt_commits, commits_with_notes) =
             overlay_ai_authorship(self, &blame_hunks, relative_file_path, options)?;
 
         Ok((
@@ -410,6 +411,7 @@ impl Repository {
             },
             authorship_logs,
             prompt_commits,
+            commits_with_notes,
         ))
     }
 
@@ -524,11 +526,12 @@ impl Repository {
     ) -> Result<(HashMap<u32, String>, HashMap<String, PromptRecord>), GitAiError> {
         let request = self.prepare_blame_request(file_path, options)?;
         let lines: Vec<&str> = request.file_content.lines().collect();
-        let (analysis, authorship_logs, prompt_commits) = self.run_blame_analysis_pipeline(
-            &request.relative_file_path,
-            &request.line_ranges,
-            &request.options,
-        )?;
+        let (analysis, authorship_logs, prompt_commits, commits_with_notes) = self
+            .run_blame_analysis_pipeline(
+                &request.relative_file_path,
+                &request.line_ranges,
+                &request.options,
+            )?;
         let BlameAnalysisResult {
             line_authors,
             prompt_records,
@@ -557,6 +560,7 @@ impl Repository {
                 &lines,
                 &request.line_ranges,
                 &request.options,
+                &commits_with_notes,
             )?;
         } else if request.options.incremental {
             output_incremental_format(
@@ -566,6 +570,7 @@ impl Repository {
                 &lines,
                 &request.line_ranges,
                 &request.options,
+                &commits_with_notes,
             )?;
         } else {
             output_default_format(
@@ -588,11 +593,12 @@ impl Repository {
         options: &GitAiBlameOptions,
     ) -> Result<BlameAnalysisResult, GitAiError> {
         let request = self.prepare_blame_request(file_path, options)?;
-        let (analysis, _authorship_logs, _prompt_commits) = self.run_blame_analysis_pipeline(
-            &request.relative_file_path,
-            &request.line_ranges,
-            &request.options,
-        )?;
+        let (analysis, _authorship_logs, _prompt_commits, _commits_with_notes) = self
+            .run_blame_analysis_pipeline(
+                &request.relative_file_path,
+                &request.line_ranges,
+                &request.options,
+            )?;
         Ok(analysis)
     }
 
@@ -1001,7 +1007,8 @@ fn overlay_ai_authorship(
         HashMap<u32, String>,
         HashMap<String, PromptRecord>,
         Vec<AuthorshipLog>,
-        HashMap<String, Vec<String>>, // prompt_hash -> commit_shas
+        HashMap<String, Vec<String>>,      // prompt_hash -> commit_shas
+        std::collections::HashSet<String>, // commit SHAs with real authorship notes
     ),
     GitAiError,
 > {
@@ -1009,9 +1016,16 @@ fn overlay_ai_authorship(
     let mut prompt_records: HashMap<String, PromptRecord> = HashMap::new();
     // Track which commits contain each prompt hash
     let mut prompt_commits: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    // Track commit SHAs that have real (non-simulated) authorship notes
+    let mut commits_with_notes: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     // Group hunks by commit SHA to avoid repeated lookups
     let mut commit_authorship_cache: HashMap<String, Option<AuthorshipLog>> = HashMap::new();
+    // Simulated authorship logs for agent commits without notes. We keep these separate
+    // from commit_authorship_cache so a single agent commit can be handled across multiple
+    // blame hunks without being limited to the first hunk's line range.
+    let mut simulated_authorship_logs: HashMap<String, AuthorshipLog> = HashMap::new();
     // Cache for foreign prompts to avoid repeated grepping
     let mut foreign_prompts_cache: HashMap<String, Option<PromptRecord>> = HashMap::new();
 
@@ -1028,6 +1042,7 @@ fn overlay_ai_authorship(
 
         // If we have AI authorship data, look up the author for lines in this hunk
         if let Some(authorship_log) = authorship_log {
+            commits_with_notes.insert(hunk.commit_sha.clone());
             // Check each line in this hunk for AI authorship using compact schema
             // IMPORTANT: Use the original line numbers from the commit, not the current line numbers
             let num_lines = hunk.range.1 - hunk.range.0 + 1;
@@ -1077,8 +1092,71 @@ fn overlay_ai_authorship(
                     }
                 }
             }
+        } else if let Some(tool) =
+            crate::authorship::agent_detection::match_email_to_agent(&hunk.author_email)
+        {
+            // No authorship log, but commit author email matches a known AI agent.
+            // Simulate authorship data so this commit is attributed to the agent.
+            let (simulated_log, prompt_hash) =
+                crate::authorship::agent_detection::simulate_agent_authorship(
+                    &hunk.commit_sha,
+                    tool,
+                    file_path,
+                    hunk.range.0,
+                    hunk.range.1,
+                );
+
+            // Merge this hunk's simulated data into a per-commit simulated log.
+            // (A single agent commit can produce multiple non-contiguous blame hunks.)
+            simulated_authorship_logs
+                .entry(hunk.commit_sha.clone())
+                .and_modify(|existing| {
+                    // Merge attestation entries for this file
+                    if let Some(file_attestation) = simulated_log.attestations.first() {
+                        for entry in &file_attestation.entries {
+                            existing
+                                .get_or_create_file(file_path)
+                                .add_entry(entry.clone());
+                        }
+                    }
+
+                    // Merge prompt stats (sum line counts across hunks)
+                    if let Some(pr) = simulated_log.metadata.prompts.get(&prompt_hash) {
+                        if let Some(existing_pr) = existing.metadata.prompts.get_mut(&prompt_hash) {
+                            existing_pr.total_additions += pr.total_additions;
+                            existing_pr.accepted_lines += pr.accepted_lines;
+                        } else {
+                            existing
+                                .metadata
+                                .prompts
+                                .insert(prompt_hash.clone(), pr.clone());
+                        }
+                    }
+                })
+                .or_insert_with(|| simulated_log.clone());
+
+            // Insert (merged) prompt record and track commits
+            if let Some(pr) = simulated_authorship_logs
+                .get(&hunk.commit_sha)
+                .and_then(|log| log.metadata.prompts.get(&prompt_hash))
+            {
+                prompt_records.insert(prompt_hash.clone(), pr.clone());
+                prompt_commits
+                    .entry(prompt_hash.clone())
+                    .or_default()
+                    .insert(hunk.commit_sha.clone());
+            }
+
+            // Mark all lines in this hunk as AI-authored by the detected tool
+            for line_num in hunk.range.0..=hunk.range.1 {
+                if options.use_prompt_hashes_as_names {
+                    line_authors.insert(line_num, prompt_hash.clone());
+                } else {
+                    line_authors.insert(line_num, tool.to_string());
+                }
+            }
         } else {
-            // No authorship log for this commit
+            // No authorship log for this commit and not a known agent
             for line_num in hunk.range.0..=hunk.range.1 {
                 if options.mark_unknown {
                     // User wants explicit distinction - mark as Unknown
@@ -1093,10 +1171,11 @@ fn overlay_ai_authorship(
     }
 
     // Collect all authorship logs we've seen (for JSON output to find other files)
-    let authorship_logs: Vec<AuthorshipLog> = commit_authorship_cache
+    let mut authorship_logs: Vec<AuthorshipLog> = commit_authorship_cache
         .into_iter()
         .filter_map(|(_, log)| log)
         .collect();
+    authorship_logs.extend(simulated_authorship_logs.into_values());
 
     // Convert HashSet to Vec and sort for deterministic output
     let prompt_commits_vec: HashMap<String, Vec<String>> = prompt_commits
@@ -1113,6 +1192,7 @@ fn overlay_ai_authorship(
         prompt_records,
         authorship_logs,
         prompt_commits_vec,
+        commits_with_notes,
     ))
 }
 
@@ -1285,6 +1365,7 @@ fn output_porcelain_format(
     lines: &[&str],
     line_ranges: &[(u32, u32)],
     options: &GitAiBlameOptions,
+    commits_with_notes: &std::collections::HashSet<String>,
 ) -> Result<(), GitAiError> {
     // Use options that don't split hunks to match git's native porcelain output
     let mut no_split_options = options.clone();
@@ -1313,7 +1394,16 @@ fn output_porcelain_format(
         };
 
         if let Some(hunk) = line_to_hunk.get(&line_num) {
-            let author_name = &hunk.original_author;
+            // For agent-detected commits (email matches known agent, no authorship note),
+            // override the author name with the tool name. Otherwise use git's original author.
+            // Only apply agent detection when no real authorship note exists for this commit.
+            let author_name = if !commits_with_notes.contains(&hunk.commit_sha) {
+                crate::authorship::agent_detection::match_email_to_agent(&hunk.author_email)
+                    .map(|t| t.to_string())
+            } else {
+                None
+            };
+            let author_name = author_name.as_deref().unwrap_or(&hunk.original_author);
             let commit_sha = &hunk.commit_sha;
             let author_email = &hunk.author_email;
             let author_time = hunk.author_time;
@@ -1417,6 +1507,7 @@ fn output_incremental_format(
     _lines: &[&str],
     line_ranges: &[(u32, u32)],
     options: &GitAiBlameOptions,
+    commits_with_notes: &std::collections::HashSet<String>,
 ) -> Result<(), GitAiError> {
     // Use options that don't split hunks to match git's native incremental output
     let mut no_split_options = options.clone();
@@ -1438,8 +1529,16 @@ fn output_incremental_format(
     let mut seen_commits: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line_num in requested_lines {
         if let Some(hunk) = line_to_hunk.get(&line_num) {
-            // For incremental format, use the original git author, not AI authorship
-            let author_name = &hunk.original_author;
+            // For agent-detected commits (email matches known agent, no authorship note),
+            // override the author name with the tool name. Otherwise use git's original author.
+            // Only apply agent detection when no real authorship note exists for this commit.
+            let author_name = if !commits_with_notes.contains(&hunk.commit_sha) {
+                crate::authorship::agent_detection::match_email_to_agent(&hunk.author_email)
+                    .map(|t| t.to_string())
+            } else {
+                None
+            };
+            let author_name = author_name.as_deref().unwrap_or(&hunk.original_author);
             let commit_sha = &hunk.commit_sha;
             let author_email = &hunk.author_email;
             let author_time = hunk.author_time;
