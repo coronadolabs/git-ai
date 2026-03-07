@@ -80,6 +80,9 @@ pub struct GitAiBlameOptions {
     pub newest_commit: Option<String>,
     pub oldest_commit: Option<String>,
     pub oldest_date: Option<DateTime<FixedOffset>>,
+    /// Raw git --since value (e.g. "2 weeks ago", "2026-01-01"), used when callers
+    /// need idiomatic git date parsing without pre-parsing to RFC3339.
+    pub oldest_date_spec: Option<String>,
 
     // Output format options
     pub porcelain: bool,
@@ -171,6 +174,7 @@ impl Default for GitAiBlameOptions {
             newest_commit: None,
             oldest_commit: None,
             oldest_date: None,
+            oldest_date_spec: None,
             line_porcelain: false,
             incremental: false,
             show_name: false,
@@ -651,7 +655,10 @@ impl Repository {
 
         // Add --since flag if oldest_date is specified
         // This controls the absolute lower bound of how far back to look
-        if let Some(ref date) = options.oldest_date {
+        if let Some(ref date_spec) = options.oldest_date_spec {
+            args.push("--since".to_string());
+            args.push(date_spec.clone());
+        } else if let Some(ref date) = options.oldest_date {
             args.push("--since".to_string());
             args.push(date.to_rfc3339());
         }

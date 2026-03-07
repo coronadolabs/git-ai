@@ -1,6 +1,9 @@
 mod repos;
 use repos::test_file::ExpectedLineExt;
-use repos::test_repo::TestRepo;
+use repos::test_repo::{NewCommit, TestRepo};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -191,6 +194,123 @@ fn assert_diff_lines_exact(lines: &[DiffLine], expected: &[(&str, &str, Option<&
             }
         }
     }
+}
+
+fn sha256_hex(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn single_prompt_id(commit: &NewCommit) -> String {
+    let mut prompt_ids: Vec<String> = commit
+        .authorship_log
+        .metadata
+        .prompts
+        .keys()
+        .cloned()
+        .collect();
+    prompt_ids.sort();
+    assert_eq!(
+        prompt_ids.len(),
+        1,
+        "expected exactly one prompt id for commit {} but got {:?}",
+        commit.commit_sha,
+        prompt_ids
+    );
+    prompt_ids[0].clone()
+}
+
+fn prompt_id_for_line_in_commit(commit: &NewCommit, file_path: &str, line: u32) -> Option<String> {
+    let file_attestation = commit
+        .authorship_log
+        .attestations
+        .iter()
+        .find(|attestation| attestation.file_path == file_path)?;
+
+    for entry in &file_attestation.entries {
+        if entry.line_ranges.iter().any(|range| range.contains(line)) {
+            return Some(entry.hash.clone());
+        }
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonHunk {
+    commit_sha: String,
+    content_hash: String,
+    hunk_kind: String,
+    original_commit_sha: Option<String>,
+    start_line: u32,
+    end_line: u32,
+    file_path: String,
+    prompt_id: Option<String>,
+}
+
+fn parse_json_hunks(json: &Value, file_path: &str, hunk_kind: &str) -> Vec<JsonHunk> {
+    let mut hunks: Vec<JsonHunk> = json["hunks"]
+        .as_array()
+        .expect("hunks should be an array")
+        .iter()
+        .filter(|hunk| hunk["file_path"] == file_path && hunk["hunk_kind"] == hunk_kind)
+        .map(|hunk| JsonHunk {
+            commit_sha: hunk["commit_sha"]
+                .as_str()
+                .expect("commit_sha should be a string")
+                .to_string(),
+            content_hash: hunk["content_hash"]
+                .as_str()
+                .expect("content_hash should be a string")
+                .to_string(),
+            hunk_kind: hunk["hunk_kind"]
+                .as_str()
+                .expect("hunk_kind should be a string")
+                .to_string(),
+            original_commit_sha: hunk["original_commit_sha"]
+                .as_str()
+                .map(ToString::to_string),
+            start_line: hunk["start_line"]
+                .as_u64()
+                .expect("start_line should be a number") as u32,
+            end_line: hunk["end_line"]
+                .as_u64()
+                .expect("end_line should be a number") as u32,
+            file_path: hunk["file_path"]
+                .as_str()
+                .expect("file_path should be a string")
+                .to_string(),
+            prompt_id: hunk["prompt_id"].as_str().map(ToString::to_string),
+        })
+        .collect();
+
+    hunks.sort_by(|a, b| {
+        (
+            a.file_path.as_str(),
+            a.hunk_kind.as_str(),
+            a.start_line,
+            a.end_line,
+            a.content_hash.as_str(),
+        )
+            .cmp(&(
+                b.file_path.as_str(),
+                b.hunk_kind.as_str(),
+                b.start_line,
+                b.end_line,
+                b.content_hash.as_str(),
+            ))
+    });
+    hunks
+}
+
+fn commit_keys(json: &Value) -> BTreeSet<String> {
+    json["commits"]
+        .as_object()
+        .expect("commits should be an object")
+        .keys()
+        .cloned()
+        .collect()
 }
 
 fn configure_repo_external_diff_helper(repo: &TestRepo) -> String {
@@ -1110,6 +1230,507 @@ fn test_diff_ignores_git_diff_opts_env_for_internal_diff() {
         ai_diff
     );
 }
+
+#[test]
+fn test_diff_respects_effective_ignore_patterns() {
+    let repo = TestRepo::new();
+    let ignore_file_path = repo.path().join(".git-ai-ignore");
+    fs::write(&ignore_file_path, "ignored/**\n").expect("should write .git-ai-ignore");
+
+    let mut visible = repo.filename("src/visible.txt");
+    let mut ignored = repo.filename("ignored/secret.txt");
+    visible.set_contents(lines!["base visible".human()]);
+    ignored.set_contents(lines!["base secret".ai()]);
+    repo.stage_all_and_commit("Initial with ignored file")
+        .unwrap();
+
+    visible.set_contents(lines!["base visible".human(), "new visible".ai()]);
+    ignored.set_contents(lines!["base secret".ai(), "new secret".ai()]);
+    let change_commit = repo
+        .stage_all_and_commit("Change visible and ignored")
+        .unwrap();
+
+    let terminal_output = repo
+        .git_ai(&["diff", &change_commit.commit_sha])
+        .expect("git-ai diff should succeed");
+    assert!(
+        terminal_output.contains("src/visible.txt"),
+        "visible file should be present in diff output"
+    );
+    assert!(
+        !terminal_output.contains("ignored/secret.txt"),
+        "ignored file should be filtered from diff output"
+    );
+
+    let json_output = repo
+        .git_ai(&["diff", &change_commit.commit_sha, "--json"])
+        .expect("git-ai diff --json should succeed");
+    let json: Value = serde_json::from_str(&json_output).expect("diff JSON should parse");
+    assert!(json["files"].get("src/visible.txt").is_some());
+    assert!(json["files"].get("ignored/secret.txt").is_none());
+
+    let hunks = json["hunks"].as_array().expect("hunks should be an array");
+    assert!(hunks.iter().all(|hunk| {
+        hunk.get("file_path")
+            .and_then(|value| value.as_str())
+            .map(|file| file == "src/visible.txt")
+            .unwrap_or(false)
+    }));
+}
+
+#[test]
+fn test_diff_blame_deletions_terminal_annotations() {
+    let repo = TestRepo::new();
+
+    let mut file = repo.filename("deletion_terminal.txt");
+    file.set_contents(lines!["keep".human(), "delete ai".ai(), "tail".human()]);
+    repo.stage_all_and_commit("Seed AI deletion line").unwrap();
+
+    file.set_contents(lines!["keep".human(), "tail".human()]);
+    let deletion_commit = repo.stage_all_and_commit("Delete AI line").unwrap();
+
+    let without_flag = repo
+        .git_ai(&["diff", &deletion_commit.commit_sha])
+        .expect("diff without --blame-deletions should succeed");
+    let without_line = parse_diff_output(&without_flag)
+        .into_iter()
+        .find(|line| line.prefix == "-" && line.content.contains("delete ai"))
+        .expect("expected deleted line in diff output");
+    let without_has_ai = without_line
+        .attribution
+        .as_ref()
+        .map(|value| value.contains("ai"))
+        .unwrap_or(false);
+    assert!(
+        !without_has_ai,
+        "deleted line should not have AI attribution without --blame-deletions"
+    );
+
+    let with_flag = repo
+        .git_ai(&["diff", &deletion_commit.commit_sha, "--blame-deletions"])
+        .expect("diff with --blame-deletions should succeed");
+    let with_line = parse_diff_output(&with_flag)
+        .into_iter()
+        .find(|line| line.prefix == "-" && line.content.contains("delete ai"))
+        .expect("expected deleted line in diff output");
+    let with_has_ai = with_line
+        .attribution
+        .as_ref()
+        .map(|value| value.contains("ai"))
+        .unwrap_or(false);
+    assert!(
+        with_has_ai,
+        "deleted line should include AI attribution with --blame-deletions, got: {:?}",
+        with_line
+    );
+}
+
+#[test]
+fn test_diff_blame_deletions_since_accepts_git_date_specs() {
+    let repo = TestRepo::new();
+
+    let mut file = repo.filename("deletion_since.txt");
+    file.set_contents(lines!["keep".human(), "remove me".ai(), "tail".human()]);
+    repo.stage_all_and_commit("Seed AI line").unwrap();
+
+    file.set_contents(lines!["keep".human(), "tail".human()]);
+    let deletion_commit = repo.stage_all_and_commit("Delete AI line").unwrap();
+
+    let json_output = repo
+        .git_ai(&[
+            "diff",
+            &deletion_commit.commit_sha,
+            "--json",
+            "--blame-deletions",
+            "--blame-deletions-since",
+            "2999-01-01",
+        ])
+        .expect("diff --json with blame-deletions-since should succeed");
+    let json: Value = serde_json::from_str(&json_output).expect("diff JSON should parse");
+
+    let deletion_hunks: Vec<&Value> = json["hunks"]
+        .as_array()
+        .expect("hunks should be array")
+        .iter()
+        .filter(|hunk| hunk["file_path"] == "deletion_since.txt" && hunk["hunk_kind"] == "deletion")
+        .collect();
+    assert!(!deletion_hunks.is_empty(), "expected deletion hunks");
+    let relative_date_output = repo
+        .git_ai(&[
+            "diff",
+            &deletion_commit.commit_sha,
+            "--json",
+            "--blame-deletions",
+            "--blame-deletions-since",
+            "2 weeks ago",
+        ])
+        .expect("diff with relative blame-deletions-since date should succeed");
+    let relative_json: Value =
+        serde_json::from_str(&relative_date_output).expect("relative date JSON should parse");
+    let relative_deletion_hunks = relative_json["hunks"]
+        .as_array()
+        .expect("hunks should be array")
+        .iter()
+        .filter(|hunk| hunk["file_path"] == "deletion_since.txt" && hunk["hunk_kind"] == "deletion")
+        .count();
+    assert!(
+        relative_deletion_hunks > 0,
+        "relative date should still produce deletion hunks"
+    );
+}
+
+#[test]
+fn test_diff_json_deleted_hunks_line_level_exact_mapping() {
+    let repo = TestRepo::new();
+
+    let mut file = repo.filename("deletion_exact.txt");
+    file.set_contents(lines![
+        "keep head".human(),
+        "AI drop one".ai(),
+        "human drop".human(),
+        "AI drop two".ai(),
+        "keep tail".human()
+    ]);
+    let source_commit = repo
+        .stage_all_and_commit("Seed exact deletion lines")
+        .unwrap();
+    let source_prompt_id = single_prompt_id(&source_commit);
+
+    file.set_contents(lines!["keep head".human(), "keep tail".human()]);
+    let deletion_commit = repo
+        .stage_all_and_commit("Delete exact target lines")
+        .unwrap();
+
+    let json_output = repo
+        .git_ai(&[
+            "diff",
+            &deletion_commit.commit_sha,
+            "--json",
+            "--blame-deletions",
+        ])
+        .expect("diff --json --blame-deletions should succeed");
+    let json: Value = serde_json::from_str(&json_output).expect("diff JSON should parse");
+
+    let deletion_hunks = parse_json_hunks(&json, "deletion_exact.txt", "deletion");
+    let expected = vec![
+        JsonHunk {
+            commit_sha: deletion_commit.commit_sha.clone(),
+            content_hash: sha256_hex("AI drop one"),
+            hunk_kind: "deletion".to_string(),
+            original_commit_sha: Some(source_commit.commit_sha.clone()),
+            start_line: 2,
+            end_line: 2,
+            file_path: "deletion_exact.txt".to_string(),
+            prompt_id: Some(source_prompt_id.clone()),
+        },
+        JsonHunk {
+            commit_sha: deletion_commit.commit_sha.clone(),
+            content_hash: sha256_hex("human drop"),
+            hunk_kind: "deletion".to_string(),
+            original_commit_sha: Some(source_commit.commit_sha.clone()),
+            start_line: 3,
+            end_line: 3,
+            file_path: "deletion_exact.txt".to_string(),
+            prompt_id: None,
+        },
+        JsonHunk {
+            commit_sha: deletion_commit.commit_sha.clone(),
+            content_hash: sha256_hex("AI drop two"),
+            hunk_kind: "deletion".to_string(),
+            original_commit_sha: Some(source_commit.commit_sha.clone()),
+            start_line: 4,
+            end_line: 4,
+            file_path: "deletion_exact.txt".to_string(),
+            prompt_id: Some(source_prompt_id),
+        },
+    ];
+    assert_eq!(deletion_hunks, expected);
+
+    let expected_commit_keys = BTreeSet::from([
+        source_commit.commit_sha.clone(),
+        deletion_commit.commit_sha.clone(),
+    ]);
+    assert_eq!(commit_keys(&json), expected_commit_keys);
+
+    let commits = json["commits"]
+        .as_object()
+        .expect("commits should be object");
+    assert_eq!(
+        commits[&source_commit.commit_sha]["msg"]
+            .as_str()
+            .expect("msg should be string"),
+        "Seed exact deletion lines"
+    );
+    assert_eq!(
+        commits[&deletion_commit.commit_sha]["msg"]
+            .as_str()
+            .expect("msg should be string"),
+        "Delete exact target lines"
+    );
+}
+
+#[test]
+fn test_diff_json_deleted_hunks_exact_replacement_from_known_origin_commit() {
+    let repo = TestRepo::new();
+    let mut file = repo.filename("replacement_exact.txt");
+
+    file.set_contents(lines!["a".ai(), "b".ai(), "c".ai()]);
+    let commit_a = repo.stage_all_and_commit("A writes abc").unwrap();
+    let prompt_a = single_prompt_id(&commit_a);
+
+    file.replace_at(0, "b".ai());
+    let commit_b = repo.stage_all_and_commit("B replaces first line").unwrap();
+    let prompt_b = single_prompt_id(&commit_b);
+
+    let output = repo
+        .git_ai(&["diff", &commit_b.commit_sha, "--json", "--blame-deletions"])
+        .expect("diff --json --blame-deletions should succeed");
+    let json: Value = serde_json::from_str(&output).expect("diff JSON should parse");
+
+    let deletion_hunks = parse_json_hunks(&json, "replacement_exact.txt", "deletion");
+    let addition_hunks = parse_json_hunks(&json, "replacement_exact.txt", "addition");
+
+    assert_eq!(
+        deletion_hunks,
+        vec![JsonHunk {
+            commit_sha: commit_b.commit_sha.clone(),
+            content_hash: sha256_hex("a"),
+            hunk_kind: "deletion".to_string(),
+            original_commit_sha: Some(commit_a.commit_sha.clone()),
+            start_line: 1,
+            end_line: 1,
+            file_path: "replacement_exact.txt".to_string(),
+            prompt_id: Some(prompt_a),
+        }]
+    );
+    assert_eq!(
+        addition_hunks,
+        vec![JsonHunk {
+            commit_sha: commit_b.commit_sha.clone(),
+            content_hash: sha256_hex("b"),
+            hunk_kind: "addition".to_string(),
+            original_commit_sha: None,
+            start_line: 1,
+            end_line: 1,
+            file_path: "replacement_exact.txt".to_string(),
+            prompt_id: Some(prompt_b),
+        }]
+    );
+
+    let expected_commit_keys =
+        BTreeSet::from([commit_a.commit_sha.clone(), commit_b.commit_sha.clone()]);
+    assert_eq!(commit_keys(&json), expected_commit_keys);
+    let commits = json["commits"]
+        .as_object()
+        .expect("commits should be object");
+    assert_eq!(
+        commits[&commit_a.commit_sha]["msg"]
+            .as_str()
+            .expect("msg should be string"),
+        "A writes abc"
+    );
+    assert_eq!(
+        commits[&commit_b.commit_sha]["msg"]
+            .as_str()
+            .expect("msg should be string"),
+        "B replaces first line"
+    );
+}
+
+#[test]
+fn test_diff_json_deleted_hunks_strict_mixed_origins_and_contiguous_segments() {
+    let repo = TestRepo::new();
+    let mut file = repo.filename("mixed_origin_exact.txt");
+
+    file.set_contents(lines![
+        "A1-ai".ai(),
+        "A2-human".human(),
+        "A3-ai".ai(),
+        "A4-human".human(),
+        "A5-ai".ai()
+    ]);
+    let commit_a = repo.stage_all_and_commit("A baseline mixed lines").unwrap();
+    let prompt_a_line_1 = prompt_id_for_line_in_commit(&commit_a, "mixed_origin_exact.txt", 1)
+        .expect("line 1 in commit A should be AI-attributed");
+    let prompt_a_line_5 = prompt_id_for_line_in_commit(&commit_a, "mixed_origin_exact.txt", 5)
+        .expect("line 5 in commit A should be AI-attributed");
+
+    file.delete_range(2, 4);
+    file.insert_at(2, vec!["B3-ai".ai(), "B4-ai".ai()]);
+    let commit_b = repo
+        .stage_all_and_commit("B rewrites middle lines")
+        .unwrap();
+    let prompt_b = prompt_id_for_line_in_commit(&commit_b, "mixed_origin_exact.txt", 3)
+        .expect("line 3 in commit B should be AI-attributed");
+
+    file.delete_range(2, 5);
+    file.delete_at(0);
+    let commit_c = repo
+        .stage_all_and_commit("C deletes mixed-origin ranges")
+        .unwrap();
+
+    let output = repo
+        .git_ai(&["diff", &commit_c.commit_sha, "--json", "--blame-deletions"])
+        .expect("diff --json --blame-deletions should succeed");
+    let json: Value = serde_json::from_str(&output).expect("diff JSON should parse");
+
+    let deletion_hunks = parse_json_hunks(&json, "mixed_origin_exact.txt", "deletion");
+    let addition_hunks = parse_json_hunks(&json, "mixed_origin_exact.txt", "addition");
+
+    assert_eq!(
+        addition_hunks,
+        vec![JsonHunk {
+            commit_sha: commit_c.commit_sha.clone(),
+            content_hash: sha256_hex("A2-human"),
+            hunk_kind: "addition".to_string(),
+            original_commit_sha: None,
+            start_line: 1,
+            end_line: 1,
+            file_path: "mixed_origin_exact.txt".to_string(),
+            prompt_id: None,
+        }]
+    );
+    assert_eq!(
+        deletion_hunks,
+        vec![
+            JsonHunk {
+                commit_sha: commit_c.commit_sha.clone(),
+                content_hash: sha256_hex("A1-ai"),
+                hunk_kind: "deletion".to_string(),
+                original_commit_sha: Some(commit_a.commit_sha.clone()),
+                start_line: 1,
+                end_line: 1,
+                file_path: "mixed_origin_exact.txt".to_string(),
+                prompt_id: Some(prompt_a_line_1),
+            },
+            JsonHunk {
+                commit_sha: commit_c.commit_sha.clone(),
+                content_hash: sha256_hex("A2-human"),
+                hunk_kind: "deletion".to_string(),
+                original_commit_sha: Some(commit_a.commit_sha.clone()),
+                start_line: 2,
+                end_line: 2,
+                file_path: "mixed_origin_exact.txt".to_string(),
+                prompt_id: None,
+            },
+            JsonHunk {
+                commit_sha: commit_c.commit_sha.clone(),
+                content_hash: sha256_hex("B3-ai\nB4-ai"),
+                hunk_kind: "deletion".to_string(),
+                original_commit_sha: Some(commit_b.commit_sha.clone()),
+                start_line: 3,
+                end_line: 4,
+                file_path: "mixed_origin_exact.txt".to_string(),
+                prompt_id: Some(prompt_b),
+            },
+            JsonHunk {
+                commit_sha: commit_c.commit_sha.clone(),
+                content_hash: sha256_hex("A5-ai"),
+                hunk_kind: "deletion".to_string(),
+                original_commit_sha: Some(commit_a.commit_sha.clone()),
+                start_line: 5,
+                end_line: 5,
+                file_path: "mixed_origin_exact.txt".to_string(),
+                prompt_id: Some(prompt_a_line_5),
+            },
+        ]
+    );
+
+    let expected_commit_keys = BTreeSet::from([
+        commit_a.commit_sha.clone(),
+        commit_b.commit_sha.clone(),
+        commit_c.commit_sha.clone(),
+    ]);
+    assert_eq!(commit_keys(&json), expected_commit_keys);
+    let commits = json["commits"]
+        .as_object()
+        .expect("commits should be object");
+    assert_eq!(
+        commits[&commit_a.commit_sha]["msg"]
+            .as_str()
+            .expect("msg should be string"),
+        "A baseline mixed lines"
+    );
+    assert_eq!(
+        commits[&commit_b.commit_sha]["msg"]
+            .as_str()
+            .expect("msg should be string"),
+        "B rewrites middle lines"
+    );
+    assert_eq!(
+        commits[&commit_c.commit_sha]["msg"]
+            .as_str()
+            .expect("msg should be string"),
+        "C deletes mixed-origin ranges"
+    );
+}
+
+#[test]
+fn test_diff_json_deleted_hunks_same_content_but_different_origins() {
+    let repo = TestRepo::new();
+    let mut file = repo.filename("duplicate_content_exact.txt");
+
+    file.set_contents(lines![
+        "top".human(),
+        "dup".ai(),
+        "middle".human(),
+        "tail".human()
+    ]);
+    let commit_a = repo.stage_all_and_commit("A creates first dup").unwrap();
+    let prompt_a = prompt_id_for_line_in_commit(&commit_a, "duplicate_content_exact.txt", 2)
+        .expect("line 2 in commit A should be AI-attributed");
+
+    file.insert_at(3, vec!["dup".ai()]);
+    let commit_b = repo.stage_all_and_commit("B adds second dup").unwrap();
+    let prompt_b = prompt_id_for_line_in_commit(&commit_b, "duplicate_content_exact.txt", 4)
+        .expect("line 4 in commit B should be AI-attributed");
+
+    file.delete_at(3);
+    file.delete_at(1);
+    let commit_c = repo
+        .stage_all_and_commit("C deletes both dup lines")
+        .unwrap();
+
+    let output = repo
+        .git_ai(&["diff", &commit_c.commit_sha, "--json", "--blame-deletions"])
+        .expect("diff --json --blame-deletions should succeed");
+    let json: Value = serde_json::from_str(&output).expect("diff JSON should parse");
+
+    let deletion_hunks = parse_json_hunks(&json, "duplicate_content_exact.txt", "deletion");
+    assert_eq!(
+        deletion_hunks,
+        vec![
+            JsonHunk {
+                commit_sha: commit_c.commit_sha.clone(),
+                content_hash: sha256_hex("dup"),
+                hunk_kind: "deletion".to_string(),
+                original_commit_sha: Some(commit_a.commit_sha.clone()),
+                start_line: 2,
+                end_line: 2,
+                file_path: "duplicate_content_exact.txt".to_string(),
+                prompt_id: Some(prompt_a),
+            },
+            JsonHunk {
+                commit_sha: commit_c.commit_sha.clone(),
+                content_hash: sha256_hex("dup"),
+                hunk_kind: "deletion".to_string(),
+                original_commit_sha: Some(commit_b.commit_sha.clone()),
+                start_line: 4,
+                end_line: 4,
+                file_path: "duplicate_content_exact.txt".to_string(),
+                prompt_id: Some(prompt_b),
+            },
+        ]
+    );
+
+    let expected_commit_keys = BTreeSet::from([
+        commit_a.commit_sha.clone(),
+        commit_b.commit_sha.clone(),
+        commit_c.commit_sha.clone(),
+    ]);
+    assert_eq!(commit_keys(&json), expected_commit_keys);
+}
+
 reuse_tests_in_worktree!(
     test_diff_single_commit,
     test_diff_commit_range,
@@ -1132,4 +1753,11 @@ reuse_tests_in_worktree!(
     test_checkpoint_and_commit_ignore_repo_external_diff_helper,
     test_diff_ignores_git_external_diff_env_but_proxy_uses_it,
     test_diff_ignores_git_diff_opts_env_for_internal_diff,
+    test_diff_respects_effective_ignore_patterns,
+    test_diff_blame_deletions_terminal_annotations,
+    test_diff_blame_deletions_since_accepts_git_date_specs,
+    test_diff_json_deleted_hunks_line_level_exact_mapping,
+    test_diff_json_deleted_hunks_exact_replacement_from_known_origin_commit,
+    test_diff_json_deleted_hunks_strict_mixed_origins_and_contiguous_segments,
+    test_diff_json_deleted_hunks_same_content_but_different_origins,
 );

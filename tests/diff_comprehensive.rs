@@ -44,6 +44,14 @@ fn test_diff_json_structure() {
         json.get("prompts").is_some(),
         "JSON should have 'prompts' field"
     );
+    assert!(
+        json.get("hunks").is_some(),
+        "JSON should have 'hunks' field"
+    );
+    assert!(
+        json.get("commits").is_some(),
+        "JSON should have 'commits' field"
+    );
 
     // Verify files is an object
     assert!(json["files"].is_object(), "files should be an object (map)");
@@ -52,6 +60,11 @@ fn test_diff_json_structure() {
     assert!(
         json["prompts"].is_object(),
         "prompts should be an object (map)"
+    );
+    assert!(json["hunks"].is_array(), "hunks should be an array");
+    assert!(
+        json["commits"].is_object(),
+        "commits should be an object (map)"
     );
 }
 

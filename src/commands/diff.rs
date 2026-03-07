@@ -1,28 +1,33 @@
 use crate::authorship::authorship_log::{LineRange, PromptRecord};
+use crate::authorship::ignore::{
+    build_ignore_matcher, effective_ignore_patterns, should_ignore_file_with_matcher,
+};
 use crate::commands::blame::GitAiBlameOptions;
 use crate::error::GitAiError;
+use crate::git::refs::show_authorship_note;
 use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profile};
 use serde::{Deserialize, Serialize, Serializer};
-use std::collections::{BTreeMap, HashMap};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
 
 // ============================================================================
 // Data Structures
 // ============================================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DiffSpec {
     SingleCommit(String),      // SHA
     TwoCommit(String, String), // start..end
 }
 
+#[derive(Debug, Clone)]
 pub enum DiffFormat {
     Json,
     GitCompatibleTerminal,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct DiffHunk {
     pub file_path: String,
     pub old_start: u32,
@@ -31,6 +36,31 @@ pub struct DiffHunk {
     pub new_count: u32,
     pub deleted_lines: Vec<u32>, // Absolute line numbers in OLD file
     pub added_lines: Vec<u32>,   // Absolute line numbers in NEW file
+    pub deleted_contents: Vec<String>,
+    pub added_contents: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffCommandOptions {
+    pub format: DiffFormat,
+    pub blame_deletions: bool,
+    pub blame_deletions_since: Option<String>,
+}
+
+impl Default for DiffCommandOptions {
+    fn default() -> Self {
+        Self {
+            format: DiffFormat::GitCompatibleTerminal,
+            blame_deletions: false,
+            blame_deletions_since: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ParsedDiffArgs {
+    pub spec: DiffSpec,
+    pub options: DiffCommandOptions,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -47,6 +77,12 @@ pub struct DiffJson {
     pub files: BTreeMap<String, FileDiffJson>,
     /// Prompt records keyed by prompt hash
     pub prompts: BTreeMap<String, PromptRecord>,
+    /// Per-hunk records for machine consumption
+    #[serde(default)]
+    pub hunks: Vec<DiffJsonHunk>,
+    /// Commit metadata for all commits referenced by hunks
+    #[serde(default)]
+    pub commits: BTreeMap<String, DiffCommitMetadata>,
 }
 
 /// Per-file diff information in JSON output
@@ -62,6 +98,30 @@ pub struct FileDiffJson {
     pub base_content: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffJsonHunk {
+    pub commit_sha: String,
+    pub content_hash: String,
+    pub hunk_kind: String, // "addition" | "deletion"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_commit_sha: Option<String>,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffCommitMetadata {
+    pub authored_time: String,
+    pub msg: String,
+    pub full_msg: String,
+    pub author: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorship_note: Option<String>,
+}
+
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 pub enum LineSide {
     Old, // For deleted lines
@@ -73,6 +133,22 @@ pub enum Attribution {
     Ai(String),    // Tool name: "cursor", "claude", etc.
     Human(String), // Username
     NoData,        // No authorship data available
+}
+
+#[derive(Debug, Clone)]
+struct LineAttributionDetail {
+    commit_sha: Option<String>,
+    prompt_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct DiffBuildArtifacts {
+    attributions: HashMap<DiffLineKey, Attribution>,
+    annotations_by_file: BTreeMap<String, BTreeMap<String, Vec<LineRange>>>,
+    prompts: BTreeMap<String, PromptRecord>,
+    json_hunks: Vec<DiffJsonHunk>,
+    commits: BTreeMap<String, DiffCommitMetadata>,
+    included_files: HashSet<String>,
 }
 
 // ============================================================================
@@ -87,8 +163,8 @@ pub fn handle_diff(repo: &Repository, args: &[String]) -> Result<(), GitAiError>
         std::process::exit(1);
     }
 
-    let (spec, format) = parse_diff_args(args)?;
-    let output = execute_diff(repo, spec, format)?;
+    let parsed = parse_diff_args(args)?;
+    let output = execute_diff(repo, parsed)?;
     print!("{}", output);
 
     Ok(())
@@ -98,20 +174,46 @@ pub fn handle_diff(repo: &Repository, args: &[String]) -> Result<(), GitAiError>
 // Argument Parsing
 // ============================================================================
 
-pub fn parse_diff_args(args: &[String]) -> Result<(DiffSpec, DiffFormat), GitAiError> {
-    let format = if args.iter().any(|arg| arg == "--json") {
-        DiffFormat::Json
-    } else {
-        DiffFormat::GitCompatibleTerminal
-    };
+pub fn parse_diff_args(args: &[String]) -> Result<ParsedDiffArgs, GitAiError> {
+    let mut options = DiffCommandOptions::default();
+    let mut positional_args: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                options.format = DiffFormat::Json;
+                i += 1;
+            }
+            "--blame-deletions" => {
+                options.blame_deletions = true;
+                i += 1;
+            }
+            "--blame-deletions-since" => {
+                if i + 1 >= args.len() {
+                    return Err(GitAiError::Generic(
+                        "--blame-deletions-since requires a value".to_string(),
+                    ));
+                }
+                options.blame_deletions_since = Some(args[i + 1].clone());
+                i += 2;
+            }
+            arg if arg.starts_with("--") => {
+                return Err(GitAiError::Generic(format!("Unknown option: {}", arg)));
+            }
+            _ => {
+                positional_args.push(args[i].as_str());
+                i += 1;
+            }
+        }
+    }
 
-    let positional_args: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|arg| *arg != "--json")
-        .collect();
+    if options.blame_deletions_since.is_some() && !options.blame_deletions {
+        return Err(GitAiError::Generic(
+            "--blame-deletions-since requires --blame-deletions".to_string(),
+        ));
+    }
 
-    match positional_args.as_slice() {
+    let spec = match positional_args.as_slice() {
         [] => {
             return Err(GitAiError::Generic(
                 "diff requires a commit or commit range argument".to_string(),
@@ -123,25 +225,21 @@ pub fn parse_diff_args(args: &[String]) -> Result<(DiffSpec, DiffFormat), GitAiE
                     "Invalid diff arguments. Expected: <commit>, <commit1>..<commit2>, or <commit1> <commit2>".to_string(),
                 ));
             }
-            return Ok((
-                DiffSpec::TwoCommit((*start).to_string(), (*end).to_string()),
-                format,
-            ));
+            DiffSpec::TwoCommit((*start).to_string(), (*end).to_string())
         }
         [arg] => {
             // Check for commit range (start..end)
             if arg.contains("..") {
                 let parts: Vec<&str> = arg.split("..").collect();
                 if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                    return Ok((
-                        DiffSpec::TwoCommit(parts[0].to_string(), parts[1].to_string()),
-                        format,
-                    ));
+                    DiffSpec::TwoCommit(parts[0].to_string(), parts[1].to_string())
                 } else {
                     return Err(GitAiError::Generic(
                         "Invalid commit range format. Expected: <commit>..<commit>".to_string(),
                     ));
                 }
+            } else {
+                DiffSpec::SingleCommit(positional_args[0].to_string())
             }
         }
         _ => {
@@ -149,26 +247,18 @@ pub fn parse_diff_args(args: &[String]) -> Result<(DiffSpec, DiffFormat), GitAiE
                 "Invalid diff arguments. Expected: <commit>, <commit1>..<commit2>, or <commit1> <commit2>".to_string(),
             ));
         }
-    }
+    };
 
-    // Single commit
-    Ok((
-        DiffSpec::SingleCommit(positional_args[0].to_string()),
-        format,
-    ))
+    Ok(ParsedDiffArgs { spec, options })
 }
 
 // ============================================================================
 // Core Execution Logic
 // ============================================================================
 
-pub fn execute_diff(
-    repo: &Repository,
-    spec: DiffSpec,
-    format: DiffFormat,
-) -> Result<String, GitAiError> {
+pub fn execute_diff(repo: &Repository, parsed: ParsedDiffArgs) -> Result<String, GitAiError> {
     // Resolve commits to get from/to SHAs
-    let (from_commit, to_commit) = match spec {
+    let (from_commit, to_commit) = match parsed.spec {
         DiffSpec::TwoCommit(start, end) => {
             // Resolve both commits
             let from = resolve_commit(repo, &start)?;
@@ -183,22 +273,23 @@ pub fn execute_diff(
         }
     };
 
-    // Step 1: Get diff hunks with line numbers
-    let hunks = get_diff_with_line_numbers(repo, &from_commit, &to_commit)?;
+    // Build a single set of artifacts used by both terminal and JSON outputs.
+    let artifacts = build_diff_artifacts(repo, &from_commit, &to_commit, &parsed.options)?;
 
-    // Step 2: Overlay AI attributions
-    let attributions = overlay_diff_attributions(repo, &from_commit, &to_commit, &hunks)?;
-
-    // Step 3: Format and output annotated diff
-    let output = match format {
+    // Format and output annotated diff
+    let output = match parsed.options.format {
         DiffFormat::Json => {
-            let diff_json = build_diff_json(repo, &from_commit, &to_commit, &hunks, &attributions)?;
+            let diff_json = build_diff_json(repo, &from_commit, &to_commit, &artifacts)?;
             serde_json::to_string(&diff_json)
                 .map_err(|e| GitAiError::Generic(format!("Failed to serialize JSON: {}", e)))?
         }
-        DiffFormat::GitCompatibleTerminal => {
-            format_annotated_diff(repo, &from_commit, &to_commit, &attributions)?
-        }
+        DiffFormat::GitCompatibleTerminal => format_annotated_diff(
+            repo,
+            &from_commit,
+            &to_commit,
+            &artifacts.attributions,
+            &artifacts.included_files,
+        )?,
     };
 
     Ok(output)
@@ -269,36 +360,97 @@ pub fn get_diff_with_line_numbers(
     from: &str,
     to: &str,
 ) -> Result<Vec<DiffHunk>, GitAiError> {
+    let diff_text = get_diff_text(repo, from, to, true)?;
+    parse_diff_hunks(&diff_text)
+}
+
+fn get_diff_text(
+    repo: &Repository,
+    from: &str,
+    to: &str,
+    zero_context: bool,
+) -> Result<String, GitAiError> {
     let mut args = repo.global_args_for_exec();
     args.push("diff".to_string());
-    args.push("-U0".to_string()); // No context lines, just changes
+    if zero_context {
+        args.push("-U0".to_string()); // No context lines, just changes
+    }
     args.push("--no-color".to_string());
     args.push("--no-renames".to_string());
     args.push(from.to_string());
     args.push(to.to_string());
 
     let output = exec_git_with_profile(&args, InternalGitProfile::PatchParse)?;
-    let diff_text = String::from_utf8(output.stdout)
-        .map_err(|e| GitAiError::Generic(format!("Failed to parse diff output: {}", e)))?;
-
-    parse_diff_hunks(&diff_text)
+    String::from_utf8(output.stdout)
+        .map_err(|e| GitAiError::Generic(format!("Failed to parse diff output: {}", e)))
 }
 
 fn parse_diff_hunks(diff_text: &str) -> Result<Vec<DiffHunk>, GitAiError> {
     let mut hunks = Vec::new();
+    let mut current_old_file: Option<String> = None;
     let mut current_file = String::new();
+    let mut current_hunk: Option<DiffHunk> = None;
+    let mut old_line_cursor = 0u32;
+    let mut new_line_cursor = 0u32;
+
+    let flush_current_hunk = |hunks: &mut Vec<DiffHunk>, current_hunk: &mut Option<DiffHunk>| {
+        if let Some(hunk) = current_hunk.take() {
+            hunks.push(hunk);
+        }
+    };
 
     for line in diff_text.lines() {
+        if line.starts_with("diff --git ") {
+            flush_current_hunk(&mut hunks, &mut current_hunk);
+            current_old_file = None;
+            current_file.clear();
+            continue;
+        }
+
+        if let Some(path_opt) = parse_old_file_path_from_minus_header_line(line) {
+            current_old_file = path_opt;
+            if current_file.is_empty() {
+                current_file = current_old_file.clone().unwrap_or_default();
+            }
+            continue;
+        }
+
         if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
-            current_file = path_opt.unwrap_or_default();
-        } else if line.starts_with("@@ ") {
-            // Hunk header
-            if let Some(hunk) = parse_hunk_line(line, &current_file)? {
-                hunks.push(hunk);
+            current_file = path_opt
+                .or_else(|| current_old_file.clone())
+                .unwrap_or_default();
+            continue;
+        }
+
+        if line.starts_with("@@ ") {
+            flush_current_hunk(&mut hunks, &mut current_hunk);
+            if let Some(mut hunk) = parse_hunk_line(line, &current_file)? {
+                old_line_cursor = hunk.old_start;
+                new_line_cursor = hunk.new_start;
+                hunk.deleted_lines.clear();
+                hunk.added_lines.clear();
+                current_hunk = Some(hunk);
+            }
+            continue;
+        }
+
+        if let Some(hunk) = current_hunk.as_mut() {
+            if line.starts_with('-') && !line.starts_with("---") {
+                hunk.deleted_lines.push(old_line_cursor);
+                hunk.deleted_contents.push(line[1..].to_string());
+                old_line_cursor += 1;
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                hunk.added_lines.push(new_line_cursor);
+                hunk.added_contents.push(line[1..].to_string());
+                new_line_cursor += 1;
+            } else if line.starts_with(' ') {
+                old_line_cursor += 1;
+                new_line_cursor += 1;
             }
         }
     }
 
+    flush_current_hunk(&mut hunks, &mut current_hunk);
     Ok(hunks)
 }
 
@@ -314,7 +466,15 @@ fn normalize_diff_path_token(path: &str) -> String {
 }
 
 fn parse_new_file_path_from_plus_header_line(line: &str) -> Option<Option<String>> {
-    let raw = line.strip_prefix("+++ ")?;
+    parse_file_path_from_header_line(line, "+++ ")
+}
+
+fn parse_old_file_path_from_minus_header_line(line: &str) -> Option<Option<String>> {
+    parse_file_path_from_header_line(line, "--- ")
+}
+
+fn parse_file_path_from_header_line(line: &str, prefix: &str) -> Option<Option<String>> {
+    let raw = line.strip_prefix(prefix)?;
     if raw.trim_end() == "/dev/null" {
         return Some(None);
     }
@@ -383,6 +543,8 @@ fn parse_hunk_line(line: &str, file_path: &str) -> Result<Option<DiffHunk>, GitA
         new_count,
         deleted_lines,
         added_lines,
+        deleted_contents: Vec::new(),
+        added_contents: Vec::new(),
     }))
 }
 
@@ -396,90 +558,258 @@ pub fn overlay_diff_attributions(
     to_commit: &str,
     hunks: &[DiffHunk],
 ) -> Result<HashMap<DiffLineKey, Attribution>, GitAiError> {
-    let mut attributions = HashMap::new();
-
-    // Group added lines by file
-    let mut lines_by_file: HashMap<String, Vec<u32>> = HashMap::new();
-    for hunk in hunks {
-        if !hunk.added_lines.is_empty() {
-            lines_by_file
-                .entry(hunk.file_path.clone())
-                .or_default()
-                .extend(&hunk.added_lines);
-        }
-    }
-
-    // For each file, call blame with the appropriate line ranges
-    for (file_path, mut lines) in lines_by_file {
-        // Sort and convert to contiguous ranges for efficient -L format
-        lines.sort_unstable();
-        lines.dedup();
-        let line_ranges = lines_to_ranges(&lines);
-
-        if line_ranges.is_empty() {
-            continue;
-        }
-
-        // Build blame options
-        let mut options = GitAiBlameOptions::default();
-        #[allow(clippy::field_reassign_with_default)]
-        {
-            options.oldest_commit = Some(from_commit.to_string());
-            options.newest_commit = Some(to_commit.to_string());
-            options.line_ranges = line_ranges;
-            options.no_output = true;
-        }
-
-        // Call blame to get attributions
-        let blame_result = repo.blame(&file_path, &options);
-
-        match blame_result {
-            Ok((line_authors, prompt_records)) => {
-                // Map blame results to Attribution enum
-                for line in &lines {
-                    if let Some(author) = line_authors.get(line) {
-                        // Check if this author is an AI tool by looking up in prompt_records
-                        let attribution = if prompt_records
-                            .values()
-                            .any(|pr| &pr.agent_id.tool == author)
-                        {
-                            Attribution::Ai(author.clone())
-                        } else {
-                            Attribution::Human(author.clone())
-                        };
-
-                        let key = DiffLineKey {
-                            file: file_path.clone(),
-                            line: *line,
-                            side: LineSide::New,
-                        };
-                        attributions.insert(key, attribution);
-                    } else {
-                        // No blame data for this line
-                        let key = DiffLineKey {
-                            file: file_path.clone(),
-                            line: *line,
-                            side: LineSide::New,
-                        };
-                        attributions.insert(key, Attribution::NoData);
-                    }
-                }
-            }
-            Err(_) => {
-                // Blame failed, mark all lines as NoData
-                for line in &lines {
-                    let key = DiffLineKey {
-                        file: file_path.clone(),
-                        line: *line,
-                        side: LineSide::New,
-                    };
-                    attributions.insert(key, Attribution::NoData);
-                }
-            }
-        }
-    }
-
+    let (_, attributions, _, _, _) = build_line_attribution_data(
+        repo,
+        from_commit,
+        to_commit,
+        hunks,
+        &DiffCommandOptions::default(),
+    )?;
     Ok(attributions)
+}
+
+fn build_diff_artifacts(
+    repo: &Repository,
+    from_commit: &str,
+    to_commit: &str,
+    options: &DiffCommandOptions,
+) -> Result<DiffBuildArtifacts, GitAiError> {
+    let effective_patterns = effective_ignore_patterns(repo, &[], &[]);
+    let ignore_matcher = build_ignore_matcher(&effective_patterns);
+
+    let mut hunks = get_diff_with_line_numbers(repo, from_commit, to_commit)?;
+    hunks.retain(|hunk| {
+        !hunk.file_path.is_empty()
+            && !should_ignore_file_with_matcher(&hunk.file_path, &ignore_matcher)
+    });
+
+    let included_files: HashSet<String> = hunks.iter().map(|h| h.file_path.clone()).collect();
+    let line_contents = build_line_content_map(&hunks);
+
+    let (annotations_by_file, attributions, line_details, prompts, mut commits) =
+        build_line_attribution_data(repo, from_commit, to_commit, &hunks, options)?;
+
+    let json_hunks = build_json_hunks(
+        repo,
+        &hunks,
+        &line_details,
+        &line_contents,
+        to_commit,
+        &mut commits,
+    )?;
+
+    Ok(DiffBuildArtifacts {
+        attributions,
+        annotations_by_file,
+        prompts,
+        json_hunks,
+        commits,
+        included_files,
+    })
+}
+
+#[allow(clippy::type_complexity)]
+fn build_line_attribution_data(
+    repo: &Repository,
+    from_commit: &str,
+    to_commit: &str,
+    hunks: &[DiffHunk],
+    options: &DiffCommandOptions,
+) -> Result<
+    (
+        BTreeMap<String, BTreeMap<String, Vec<LineRange>>>,
+        HashMap<DiffLineKey, Attribution>,
+        HashMap<DiffLineKey, LineAttributionDetail>,
+        BTreeMap<String, PromptRecord>,
+        BTreeMap<String, DiffCommitMetadata>,
+    ),
+    GitAiError,
+> {
+    let mut annotations_by_file: BTreeMap<String, BTreeMap<String, Vec<LineRange>>> =
+        BTreeMap::new();
+    let mut attributions: HashMap<DiffLineKey, Attribution> = HashMap::new();
+    let mut line_details: HashMap<DiffLineKey, LineAttributionDetail> = HashMap::new();
+    let mut prompts: BTreeMap<String, PromptRecord> = BTreeMap::new();
+    let mut commits: BTreeMap<String, DiffCommitMetadata> = BTreeMap::new();
+
+    let added_lines_by_file = collect_lines_by_file(hunks, LineSide::New);
+    let deleted_lines_by_file = collect_lines_by_file(hunks, LineSide::Old);
+    let mut files: HashSet<String> = added_lines_by_file.keys().cloned().collect();
+    files.extend(deleted_lines_by_file.keys().cloned());
+
+    for file_path in files {
+        if let Some(lines) = added_lines_by_file.get(&file_path) {
+            apply_blame_for_side(
+                repo,
+                &file_path,
+                lines,
+                LineSide::New,
+                from_commit,
+                Some(to_commit),
+                None,
+                &mut annotations_by_file,
+                &mut attributions,
+                &mut line_details,
+                &mut prompts,
+                &mut commits,
+            );
+        }
+
+        if options.blame_deletions
+            && let Some(lines) = deleted_lines_by_file.get(&file_path)
+        {
+            apply_blame_for_side(
+                repo,
+                &file_path,
+                lines,
+                LineSide::Old,
+                from_commit,
+                None,
+                options.blame_deletions_since.clone(),
+                &mut annotations_by_file,
+                &mut attributions,
+                &mut line_details,
+                &mut prompts,
+                &mut commits,
+            );
+        }
+    }
+
+    Ok((
+        annotations_by_file,
+        attributions,
+        line_details,
+        prompts,
+        commits,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_blame_for_side(
+    repo: &Repository,
+    file_path: &str,
+    lines: &[u32],
+    side: LineSide,
+    from_commit: &str,
+    newest_commit: Option<&str>,
+    oldest_date_spec: Option<String>,
+    annotations_by_file: &mut BTreeMap<String, BTreeMap<String, Vec<LineRange>>>,
+    attributions: &mut HashMap<DiffLineKey, Attribution>,
+    line_details: &mut HashMap<DiffLineKey, LineAttributionDetail>,
+    prompts: &mut BTreeMap<String, PromptRecord>,
+    commits: &mut BTreeMap<String, DiffCommitMetadata>,
+) {
+    if lines.is_empty() {
+        return;
+    }
+
+    let line_ranges = lines_to_ranges(lines);
+    if line_ranges.is_empty() {
+        return;
+    }
+
+    let mut blame_options = GitAiBlameOptions::default();
+    blame_options.line_ranges = line_ranges;
+    blame_options.no_output = true;
+    blame_options.use_prompt_hashes_as_names = true;
+    blame_options.newest_commit = Some(newest_commit.unwrap_or(from_commit).to_string());
+    if matches!(side, LineSide::New) {
+        blame_options.oldest_commit = Some(from_commit.to_string());
+    } else {
+        blame_options.oldest_date_spec = oldest_date_spec;
+    }
+
+    let analysis = match repo.blame_analysis(file_path, &blame_options) {
+        Ok(analysis) => analysis,
+        Err(_) => {
+            for line in lines {
+                attributions.insert(
+                    DiffLineKey {
+                        file: file_path.to_string(),
+                        line: *line,
+                        side: side.clone(),
+                    },
+                    Attribution::NoData,
+                );
+            }
+            return;
+        }
+    };
+
+    for (prompt_id, prompt_record) in &analysis.prompt_records {
+        prompts
+            .entry(prompt_id.clone())
+            .or_insert_with(|| prompt_record.clone());
+    }
+
+    let mut line_to_commit: HashMap<u32, String> = HashMap::new();
+    for blame_hunk in &analysis.blame_hunks {
+        ensure_commit_metadata(repo, &blame_hunk.commit_sha, commits);
+        for line in blame_hunk.range.0..=blame_hunk.range.1 {
+            line_to_commit.insert(line, blame_hunk.commit_sha.clone());
+        }
+    }
+
+    let mut lines_by_prompt_id: HashMap<String, Vec<u32>> = HashMap::new();
+
+    for line in lines {
+        let key = DiffLineKey {
+            file: file_path.to_string(),
+            line: *line,
+            side: side.clone(),
+        };
+
+        if let Some(author_marker) = analysis.line_authors.get(line) {
+            let prompt_id = if analysis.prompt_records.contains_key(author_marker) {
+                Some(author_marker.clone())
+            } else {
+                None
+            };
+
+            let attribution = if let Some(ref id) = prompt_id {
+                let tool = analysis
+                    .prompt_records
+                    .get(id)
+                    .map(|prompt| prompt.agent_id.tool.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                lines_by_prompt_id
+                    .entry(id.clone())
+                    .or_default()
+                    .push(*line);
+                Attribution::Ai(tool)
+            } else {
+                Attribution::Human(author_marker.clone())
+            };
+            attributions.insert(key.clone(), attribution);
+            line_details.insert(
+                key,
+                LineAttributionDetail {
+                    commit_sha: line_to_commit.get(line).cloned(),
+                    prompt_id,
+                },
+            );
+        } else {
+            attributions.insert(key.clone(), Attribution::NoData);
+            line_details.insert(
+                key,
+                LineAttributionDetail {
+                    commit_sha: None,
+                    prompt_id: None,
+                },
+            );
+        }
+    }
+
+    if matches!(side, LineSide::New) {
+        let file_annotations = annotations_by_file
+            .entry(file_path.to_string())
+            .or_default();
+        for (prompt_id, mut prompt_lines) in lines_by_prompt_id {
+            prompt_lines.sort_unstable();
+            prompt_lines.dedup();
+            file_annotations.insert(prompt_id, LineRange::compress_lines(&prompt_lines));
+        }
+    }
 }
 
 /// Convert a sorted list of line numbers to contiguous ranges
@@ -511,6 +841,269 @@ fn lines_to_ranges(lines: &[u32]) -> Vec<(u32, u32)> {
     ranges
 }
 
+fn collect_lines_by_file(hunks: &[DiffHunk], side: LineSide) -> HashMap<String, Vec<u32>> {
+    let mut lines_by_file: HashMap<String, Vec<u32>> = HashMap::new();
+    for hunk in hunks {
+        let lines = match side {
+            LineSide::Old => &hunk.deleted_lines,
+            LineSide::New => &hunk.added_lines,
+        };
+        if lines.is_empty() {
+            continue;
+        }
+        lines_by_file
+            .entry(hunk.file_path.clone())
+            .or_default()
+            .extend(lines.iter().copied());
+    }
+
+    for lines in lines_by_file.values_mut() {
+        lines.sort_unstable();
+        lines.dedup();
+    }
+
+    lines_by_file
+}
+
+fn build_line_content_map(hunks: &[DiffHunk]) -> HashMap<DiffLineKey, String> {
+    let mut content_map = HashMap::new();
+
+    for hunk in hunks {
+        for (line, content) in hunk.deleted_lines.iter().zip(hunk.deleted_contents.iter()) {
+            content_map.insert(
+                DiffLineKey {
+                    file: hunk.file_path.clone(),
+                    line: *line,
+                    side: LineSide::Old,
+                },
+                content.clone(),
+            );
+        }
+        for (line, content) in hunk.added_lines.iter().zip(hunk.added_contents.iter()) {
+            content_map.insert(
+                DiffLineKey {
+                    file: hunk.file_path.clone(),
+                    line: *line,
+                    side: LineSide::New,
+                },
+                content.clone(),
+            );
+        }
+    }
+
+    content_map
+}
+
+fn build_json_hunks(
+    repo: &Repository,
+    diff_hunks: &[DiffHunk],
+    line_details: &HashMap<DiffLineKey, LineAttributionDetail>,
+    line_contents: &HashMap<DiffLineKey, String>,
+    diff_to_commit: &str,
+    commits: &mut BTreeMap<String, DiffCommitMetadata>,
+) -> Result<Vec<DiffJsonHunk>, GitAiError> {
+    let mut hunks: Vec<DiffJsonHunk> = Vec::new();
+
+    for diff_hunk in diff_hunks {
+        hunks.extend(build_json_hunk_segments(
+            repo,
+            diff_hunk,
+            LineSide::New,
+            "addition",
+            diff_to_commit,
+            line_details,
+            line_contents,
+            commits,
+        )?);
+        hunks.extend(build_json_hunk_segments(
+            repo,
+            diff_hunk,
+            LineSide::Old,
+            "deletion",
+            diff_to_commit,
+            line_details,
+            line_contents,
+            commits,
+        )?);
+    }
+
+    Ok(hunks)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_json_hunk_segments(
+    repo: &Repository,
+    diff_hunk: &DiffHunk,
+    side: LineSide,
+    kind: &str,
+    diff_to_commit: &str,
+    line_details: &HashMap<DiffLineKey, LineAttributionDetail>,
+    line_contents: &HashMap<DiffLineKey, String>,
+    commits: &mut BTreeMap<String, DiffCommitMetadata>,
+) -> Result<Vec<DiffJsonHunk>, GitAiError> {
+    let lines = match side {
+        LineSide::Old => &diff_hunk.deleted_lines,
+        LineSide::New => &diff_hunk.added_lines,
+    };
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut segments: Vec<DiffJsonHunk> = Vec::new();
+    let mut current_start = 0u32;
+    let mut current_end = 0u32;
+    let mut current_prompt_id: Option<String> = None;
+    let mut current_original_commit_sha: Option<String> = None;
+    let mut current_commit_sha = String::new();
+    let mut current_contents: Vec<String> = Vec::new();
+
+    let flush = |segments: &mut Vec<DiffJsonHunk>,
+                 current_start: &mut u32,
+                 current_end: &mut u32,
+                 current_prompt_id: &mut Option<String>,
+                 current_original_commit_sha: &mut Option<String>,
+                 current_commit_sha: &mut String,
+                 current_contents: &mut Vec<String>| {
+        if *current_start == 0 {
+            return;
+        }
+        let content_hash = hash_hunk_content(current_contents);
+        segments.push(DiffJsonHunk {
+            commit_sha: current_commit_sha.clone(),
+            content_hash,
+            hunk_kind: kind.to_string(),
+            original_commit_sha: current_original_commit_sha.clone(),
+            start_line: *current_start,
+            end_line: *current_end,
+            file_path: diff_hunk.file_path.clone(),
+            prompt_id: current_prompt_id.clone(),
+        });
+        *current_start = 0;
+        *current_end = 0;
+        *current_prompt_id = None;
+        *current_original_commit_sha = None;
+        current_commit_sha.clear();
+        current_contents.clear();
+    };
+
+    for line in lines {
+        let key = DiffLineKey {
+            file: diff_hunk.file_path.clone(),
+            line: *line,
+            side: side.clone(),
+        };
+        let detail = line_details.get(&key);
+        let prompt_id = detail.and_then(|d| d.prompt_id.clone());
+        let original_commit_sha = if matches!(side, LineSide::Old) {
+            detail.and_then(|d| d.commit_sha.clone())
+        } else {
+            None
+        };
+        let commit_sha = if matches!(side, LineSide::Old) {
+            diff_to_commit.to_string()
+        } else {
+            detail
+                .and_then(|d| d.commit_sha.clone())
+                .unwrap_or_else(|| diff_to_commit.to_string())
+        };
+
+        if let Some(ref original_sha) = original_commit_sha {
+            ensure_commit_metadata(repo, original_sha, commits);
+        }
+        ensure_commit_metadata(repo, &commit_sha, commits);
+
+        let can_extend = current_start != 0
+            && *line == current_end + 1
+            && prompt_id == current_prompt_id
+            && original_commit_sha == current_original_commit_sha
+            && commit_sha == current_commit_sha;
+
+        if !can_extend {
+            flush(
+                &mut segments,
+                &mut current_start,
+                &mut current_end,
+                &mut current_prompt_id,
+                &mut current_original_commit_sha,
+                &mut current_commit_sha,
+                &mut current_contents,
+            );
+            current_start = *line;
+            current_end = *line;
+            current_prompt_id = prompt_id.clone();
+            current_original_commit_sha = original_commit_sha.clone();
+            current_commit_sha = commit_sha;
+        } else {
+            current_end = *line;
+        }
+
+        current_contents.push(line_contents.get(&key).cloned().unwrap_or_default());
+    }
+
+    flush(
+        &mut segments,
+        &mut current_start,
+        &mut current_end,
+        &mut current_prompt_id,
+        &mut current_original_commit_sha,
+        &mut current_commit_sha,
+        &mut current_contents,
+    );
+
+    Ok(segments)
+}
+
+fn hash_hunk_content(lines: &[String]) -> String {
+    let joined = lines.join("\n");
+    let mut hasher = Sha256::new();
+    hasher.update(joined.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn ensure_commit_metadata(
+    repo: &Repository,
+    commit_sha: &str,
+    commits: &mut BTreeMap<String, DiffCommitMetadata>,
+) {
+    if commits.contains_key(commit_sha) {
+        return;
+    }
+    if let Ok(metadata) = load_commit_metadata(repo, commit_sha) {
+        commits.insert(commit_sha.to_string(), metadata);
+    }
+}
+
+fn load_commit_metadata(
+    repo: &Repository,
+    commit_sha: &str,
+) -> Result<DiffCommitMetadata, GitAiError> {
+    let mut args = repo.global_args_for_exec();
+    args.push("show".to_string());
+    args.push("-s".to_string());
+    args.push("--no-notes".to_string());
+    args.push("--encoding=UTF-8".to_string());
+    args.push("--format=%an <%ae>%x00%aI%x00%s%x00%B".to_string());
+    args.push(commit_sha.to_string());
+
+    let output = exec_git_with_profile(&args, InternalGitProfile::General)?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| GitAiError::Generic(format!("Failed to parse commit metadata: {}", e)))?;
+    let mut parts = stdout.splitn(4, '\0');
+    let author = parts.next().unwrap_or("").trim().to_string();
+    let authored_time = parts.next().unwrap_or("").trim().to_string();
+    let msg = parts.next().unwrap_or("").trim().to_string();
+    let full_msg = parts.next().unwrap_or("").trim_end().to_string();
+    let authorship_note = show_authorship_note(repo, commit_sha);
+
+    Ok(DiffCommitMetadata {
+        authored_time,
+        msg,
+        full_msg,
+        author,
+        authorship_note,
+    })
+}
+
 // ============================================================================
 // JSON Output Building
 // ============================================================================
@@ -520,44 +1113,30 @@ fn build_diff_json(
     repo: &Repository,
     from_commit: &str,
     to_commit: &str,
-    hunks: &[DiffHunk],
-    _attributions: &HashMap<DiffLineKey, Attribution>,
+    artifacts: &DiffBuildArtifacts,
 ) -> Result<DiffJson, GitAiError> {
     let mut files: BTreeMap<String, FileDiffJson> = BTreeMap::new();
-    let mut all_prompts: BTreeMap<String, PromptRecord> = BTreeMap::new();
-
-    // Get the full diff output and split by file
     let file_diffs = get_diff_split_by_file(repo, from_commit, to_commit)?;
+    let mut files_sorted: Vec<&String> = artifacts.included_files.iter().collect();
+    files_sorted.sort();
 
-    // Get unique files from hunks
-    let mut unique_files: Vec<String> = hunks.iter().map(|h| h.file_path.clone()).collect();
-    unique_files.sort();
-    unique_files.dedup();
-
-    // For each file, collect annotations, diff, and base content
-    for file_path in &unique_files {
-        // Get annotations for this file (lines attributed to AI prompts)
-        let file_annotations =
-            collect_file_annotations(repo, from_commit, to_commit, file_path, hunks)?;
-
-        // Merge prompt records into the global map
-        for (hash, prompt_record) in &file_annotations.1 {
-            all_prompts.insert(hash.clone(), prompt_record.clone());
-        }
-
-        // Get the diff for this file
+    for file_path in files_sorted {
         let diff = file_diffs.get(file_path).cloned().unwrap_or_default();
 
-        // Get base content (file content at from_commit)
         let base_content = match repo.get_file_content(file_path, from_commit) {
             Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
-            Err(_) => String::new(), // File didn't exist in from_commit (new file)
+            Err(_) => String::new(),
         };
+        let annotations = artifacts
+            .annotations_by_file
+            .get(file_path)
+            .cloned()
+            .unwrap_or_default();
 
         files.insert(
             file_path.clone(),
             FileDiffJson {
-                annotations: file_annotations.0,
+                annotations,
                 diff,
                 base_content,
             },
@@ -566,7 +1145,9 @@ fn build_diff_json(
 
     Ok(DiffJson {
         files,
-        prompts: all_prompts,
+        prompts: artifacts.prompts.clone(),
+        hunks: artifacts.json_hunks.clone(),
+        commits: artifacts.commits.clone(),
     })
 }
 
@@ -576,134 +1157,69 @@ fn get_diff_split_by_file(
     from_commit: &str,
     to_commit: &str,
 ) -> Result<HashMap<String, String>, GitAiError> {
-    let mut args = repo.global_args_for_exec();
-    args.push("diff".to_string());
-    args.push("--no-color".to_string());
-    args.push("--no-renames".to_string());
-    args.push(from_commit.to_string());
-    args.push(to_commit.to_string());
-
-    let output = exec_git_with_profile(&args, InternalGitProfile::PatchParse)?;
-    let diff_text = String::from_utf8(output.stdout)
-        .map_err(|e| GitAiError::Generic(format!("Failed to parse diff output: {}", e)))?;
-
+    let sections = get_diff_sections_by_file(repo, from_commit, to_commit)?;
     let mut file_diffs: HashMap<String, String> = HashMap::new();
-    let mut current_file = String::new();
-    let mut current_diff = String::new();
-
-    for line in diff_text.lines() {
-        if line.starts_with("diff --git") {
-            // Save previous file's diff if any
-            if !current_file.is_empty() && !current_diff.is_empty() {
-                file_diffs.insert(current_file.clone(), current_diff.clone());
-            }
-            current_diff = format!("{}\n", line);
-            current_file.clear();
-        } else if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
-            current_file = path_opt.unwrap_or_default();
-            current_diff.push_str(line);
-            current_diff.push('\n');
-        } else {
-            current_diff.push_str(line);
-            current_diff.push('\n');
-        }
+    for (file_path, diff_text) in sections {
+        file_diffs.insert(file_path, diff_text);
     }
-
-    // Don't forget the last file
-    if !current_file.is_empty() && !current_diff.is_empty() {
-        file_diffs.insert(current_file, current_diff);
-    }
-
     Ok(file_diffs)
 }
 
-/// Collect annotations for a specific file, returning (annotations_map, prompt_records_map)
-#[allow(clippy::type_complexity)]
-fn collect_file_annotations(
+fn get_diff_sections_by_file(
     repo: &Repository,
     from_commit: &str,
     to_commit: &str,
-    file_path: &str,
-    hunks: &[DiffHunk],
-) -> Result<
-    (
-        BTreeMap<String, Vec<LineRange>>,
-        HashMap<String, PromptRecord>,
-    ),
-    GitAiError,
-> {
-    let mut annotations: BTreeMap<String, Vec<LineRange>> = BTreeMap::new();
-    let mut prompt_records: HashMap<String, PromptRecord> = HashMap::new();
+) -> Result<Vec<(String, String)>, GitAiError> {
+    let diff_text = get_diff_text(repo, from_commit, to_commit, false)?;
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current_file = String::new();
+    let mut current_diff = String::new();
+    let mut current_old_file: Option<String> = None;
 
-    // Collect all added lines for this file
-    let mut added_lines: Vec<u32> = Vec::new();
-    for hunk in hunks {
-        if hunk.file_path == file_path {
-            added_lines.extend(&hunk.added_lines);
+    let flush_section = |sections: &mut Vec<(String, String)>,
+                         current_file: &mut String,
+                         current_diff: &mut String| {
+        if !current_file.is_empty() && !current_diff.is_empty() {
+            sections.push((current_file.clone(), current_diff.clone()));
         }
-    }
+        current_file.clear();
+        current_diff.clear();
+    };
 
-    if added_lines.is_empty() {
-        return Ok((annotations, prompt_records));
-    }
+    for line in diff_text.lines() {
+        if line.starts_with("diff --git ") {
+            flush_section(&mut sections, &mut current_file, &mut current_diff);
+            current_old_file = None;
+            current_diff.push_str(line);
+            current_diff.push('\n');
+            continue;
+        }
 
-    added_lines.sort_unstable();
-    added_lines.dedup();
-    let line_ranges = lines_to_ranges(&added_lines);
+        if current_diff.is_empty() {
+            continue;
+        }
 
-    if line_ranges.is_empty() {
-        return Ok((annotations, prompt_records));
-    }
+        current_diff.push_str(line);
+        current_diff.push('\n');
 
-    // Build blame options - use prompt hashes as names to get the actual hash per line
-    let mut options = GitAiBlameOptions::default();
-    #[allow(clippy::field_reassign_with_default)]
-    {
-        options.oldest_commit = Some(from_commit.to_string());
-        options.newest_commit = Some(to_commit.to_string());
-        options.line_ranges = line_ranges;
-        options.no_output = true;
-        options.use_prompt_hashes_as_names = true; // Key: get prompt hash instead of tool name
-    }
-
-    // Call blame to get attributions
-    let blame_result = repo.blame(file_path, &options);
-
-    match blame_result {
-        Ok((line_authors, blame_prompt_records)) => {
-            // Group lines by prompt hash
-            // With use_prompt_hashes_as_names=true, line_authors values are the prompt hashes
-            let mut lines_by_hash: HashMap<String, Vec<u32>> = HashMap::new();
-
-            for &line in &added_lines {
-                if let Some(prompt_hash) = line_authors.get(&line) {
-                    // Only include if this hash is in the prompt_records (i.e., it's an AI line)
-                    if blame_prompt_records.contains_key(prompt_hash) {
-                        lines_by_hash
-                            .entry(prompt_hash.clone())
-                            .or_default()
-                            .push(line);
-                    }
-                }
+        if let Some(path_opt) = parse_old_file_path_from_minus_header_line(line) {
+            current_old_file = path_opt.clone();
+            if current_file.is_empty() {
+                current_file = path_opt.unwrap_or_default();
             }
-
-            // Convert lines to LineRange format and store in annotations
-            for (hash, mut lines) in lines_by_hash {
-                lines.sort_unstable();
-                lines.dedup();
-                let ranges = LineRange::compress_lines(&lines);
-                annotations.insert(hash, ranges);
-            }
-
-            // Store prompt records
-            prompt_records = blame_prompt_records;
+            continue;
         }
-        Err(_) => {
-            // Blame failed, no annotations for this file
+
+        if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
+            current_file = path_opt
+                .or_else(|| current_old_file.clone())
+                .unwrap_or_default();
+            continue;
         }
     }
 
-    Ok((annotations, prompt_records))
+    flush_section(&mut sections, &mut current_file, &mut current_diff);
+    Ok(sections)
 }
 
 // ============================================================================
@@ -716,90 +1232,70 @@ pub fn format_annotated_diff(
     from_commit: &str,
     to_commit: &str,
     attributions: &HashMap<DiffLineKey, Attribution>,
+    included_files: &HashSet<String>,
 ) -> Result<String, GitAiError> {
-    // Execute git diff with normal context
-    let mut args = repo.global_args_for_exec();
-    args.push("diff".to_string());
-    args.push("--no-color".to_string());
-    args.push("--no-renames".to_string());
-    args.push(from_commit.to_string());
-    args.push(to_commit.to_string());
-
-    let output = exec_git_with_profile(&args, InternalGitProfile::PatchParse)?;
-    let diff_text = String::from_utf8(output.stdout)
-        .map_err(|e| GitAiError::Generic(format!("Failed to parse diff output: {}", e)))?;
-
-    // Check if we should use colors
+    let sections = get_diff_sections_by_file(repo, from_commit, to_commit)?;
     let use_color = std::io::stdout().is_terminal();
-
-    // Parse and annotate diff
     let mut result = String::new();
-    let mut current_file = String::new();
-    let mut old_line_num = 0u32;
-    let mut new_line_num = 0u32;
 
-    for line in diff_text.lines() {
-        if line.starts_with("diff --git") {
-            // Diff header
-            result.push_str(&format_line(line, LineType::DiffHeader, use_color, None));
-            current_file.clear();
-            old_line_num = 0;
-            new_line_num = 0;
-        } else if line.starts_with("index ") {
-            result.push_str(&format_line(line, LineType::DiffHeader, use_color, None));
-        } else if line.starts_with("--- ") {
-            result.push_str(&format_line(line, LineType::DiffHeader, use_color, None));
-        } else if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
-            current_file = path_opt.unwrap_or_default();
-            result.push_str(&format_line(line, LineType::DiffHeader, use_color, None));
-        } else if line.starts_with("@@ ") {
-            // Hunk header - update line counters
-            if let Some((old_start, new_start)) = parse_hunk_header_for_line_nums(line) {
-                old_line_num = old_start;
-                new_line_num = new_start;
+    for (file_path, section_text) in sections {
+        if !included_files.contains(&file_path) {
+            continue;
+        }
+
+        let mut old_line_num = 0u32;
+        let mut new_line_num = 0u32;
+
+        for line in section_text.lines() {
+            if line.starts_with("diff --git")
+                || line.starts_with("index ")
+                || line.starts_with("--- ")
+                || line.starts_with("+++ ")
+            {
+                result.push_str(&format_line(line, LineType::DiffHeader, use_color, None));
+            } else if line.starts_with("@@ ") {
+                if let Some((old_start, new_start)) = parse_hunk_header_for_line_nums(line) {
+                    old_line_num = old_start;
+                    new_line_num = new_start;
+                }
+                result.push_str(&format_line(line, LineType::HunkHeader, use_color, None));
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                let key = DiffLineKey {
+                    file: file_path.clone(),
+                    line: old_line_num,
+                    side: LineSide::Old,
+                };
+                let attribution = attributions.get(&key);
+                result.push_str(&format_line(
+                    line,
+                    LineType::Deletion,
+                    use_color,
+                    attribution,
+                ));
+                old_line_num += 1;
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                let key = DiffLineKey {
+                    file: file_path.clone(),
+                    line: new_line_num,
+                    side: LineSide::New,
+                };
+                let attribution = attributions.get(&key);
+                result.push_str(&format_line(
+                    line,
+                    LineType::Addition,
+                    use_color,
+                    attribution,
+                ));
+                new_line_num += 1;
+            } else if line.starts_with(' ') {
+                result.push_str(&format_line(line, LineType::Context, use_color, None));
+                old_line_num += 1;
+                new_line_num += 1;
+            } else if line.starts_with("Binary files") {
+                result.push_str(&format_line(line, LineType::Binary, use_color, None));
+            } else {
+                result.push_str(&format_line(line, LineType::Context, use_color, None));
             }
-            result.push_str(&format_line(line, LineType::HunkHeader, use_color, None));
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            // Deleted line
-            let key = DiffLineKey {
-                file: current_file.clone(),
-                line: old_line_num,
-                side: LineSide::Old,
-            };
-            let attribution = attributions.get(&key);
-            result.push_str(&format_line(
-                line,
-                LineType::Deletion,
-                use_color,
-                attribution,
-            ));
-            old_line_num += 1;
-        } else if line.starts_with('+') && !line.starts_with("+++") {
-            // Added line
-            let key = DiffLineKey {
-                file: current_file.clone(),
-                line: new_line_num,
-                side: LineSide::New,
-            };
-            let attribution = attributions.get(&key);
-            result.push_str(&format_line(
-                line,
-                LineType::Addition,
-                use_color,
-                attribution,
-            ));
-            new_line_num += 1;
-        } else if line.starts_with(' ') {
-            // Context line
-            result.push_str(&format_line(line, LineType::Context, use_color, None));
-            old_line_num += 1;
-            new_line_num += 1;
-        } else if line.starts_with("Binary files") {
-            // Binary file marker
-            result.push_str(&format_line(line, LineType::Binary, use_color, None));
-        } else {
-            // Other lines (e.g., "\ No newline at end of file")
-            result.push_str(&format_line(line, LineType::Context, use_color, None));
         }
     }
 
@@ -961,20 +1457,23 @@ pub fn get_diff_json_filtered(
     let to_commit = resolve_commit(repo, commit_sha)?;
     let from_commit = resolve_parent(repo, &to_commit)?;
 
-    // Get diff hunks with line numbers
-    let hunks = get_diff_with_line_numbers(repo, &from_commit, &to_commit)?;
+    let artifacts = build_diff_artifacts(
+        repo,
+        &from_commit,
+        &to_commit,
+        &DiffCommandOptions {
+            format: DiffFormat::Json,
+            ..DiffCommandOptions::default()
+        },
+    )?;
 
-    // Get attributions for overlay (not used directly, but needed for build_diff_json)
-    let attributions = overlay_diff_attributions(repo, &from_commit, &to_commit, &hunks)?;
-
-    // Build the full DiffJson structure
-    let mut diff_json = build_diff_json(repo, &from_commit, &to_commit, &hunks, &attributions)?;
+    let mut diff_json = build_diff_json(repo, &from_commit, &to_commit, &artifacts)?;
 
     // Apply filtering if requested
     if options.filter_to_attributed_files
         && let Some(ref prompt_ids) = options.prompt_ids
     {
-        let prompt_id_set: std::collections::HashSet<&String> = prompt_ids.iter().collect();
+        let prompt_id_set: HashSet<&String> = prompt_ids.iter().collect();
 
         // Filter files to only those with attributions from the specified prompts
         diff_json.files.retain(|_file_path, file_diff| {
@@ -984,15 +1483,31 @@ pub fn get_diff_json_filtered(
                 .keys()
                 .any(|key| prompt_id_set.contains(key))
         });
+
+        let kept_files: HashSet<String> = diff_json.files.keys().cloned().collect();
+        diff_json
+            .hunks
+            .retain(|hunk| kept_files.contains(&hunk.file_path));
     }
 
     // Filter prompts to only those specified (if any)
     if let Some(ref prompt_ids) = options.prompt_ids {
-        let prompt_id_set: std::collections::HashSet<&String> = prompt_ids.iter().collect();
+        let prompt_id_set: HashSet<&String> = prompt_ids.iter().collect();
         diff_json
             .prompts
             .retain(|key, _| prompt_id_set.contains(key));
     }
+
+    let mut referenced_commit_shas: HashSet<String> = HashSet::new();
+    for hunk in &diff_json.hunks {
+        referenced_commit_shas.insert(hunk.commit_sha.clone());
+        if let Some(original) = &hunk.original_commit_sha {
+            referenced_commit_shas.insert(original.clone());
+        }
+    }
+    diff_json
+        .commits
+        .retain(|sha, _| referenced_commit_shas.contains(sha));
 
     Ok(diff_json)
 }
@@ -1008,22 +1523,29 @@ mod tests {
     #[test]
     fn test_parse_diff_args_single_commit() {
         let args = vec!["abc123".to_string()];
-        let (spec, _format) = parse_diff_args(&args).unwrap();
+        let parsed = parse_diff_args(&args).unwrap();
 
-        match spec {
+        match parsed.spec {
             DiffSpec::SingleCommit(sha) => {
                 assert_eq!(sha, "abc123");
             }
             _ => panic!("Expected SingleCommit"),
         }
+
+        assert!(matches!(
+            parsed.options.format,
+            DiffFormat::GitCompatibleTerminal
+        ));
+        assert!(!parsed.options.blame_deletions);
+        assert!(parsed.options.blame_deletions_since.is_none());
     }
 
     #[test]
     fn test_parse_diff_args_commit_range() {
         let args = vec!["abc123..def456".to_string()];
-        let (spec, _format) = parse_diff_args(&args).unwrap();
+        let parsed = parse_diff_args(&args).unwrap();
 
-        match spec {
+        match parsed.spec {
             DiffSpec::TwoCommit(start, end) => {
                 assert_eq!(start, "abc123");
                 assert_eq!(end, "def456");
@@ -1035,9 +1557,9 @@ mod tests {
     #[test]
     fn test_parse_diff_args_two_positional_commits() {
         let args = vec!["abc123".to_string(), "def456".to_string()];
-        let (spec, _format) = parse_diff_args(&args).unwrap();
+        let parsed = parse_diff_args(&args).unwrap();
 
-        match spec {
+        match parsed.spec {
             DiffSpec::TwoCommit(start, end) => {
                 assert_eq!(start, "abc123");
                 assert_eq!(end, "def456");
@@ -1053,9 +1575,9 @@ mod tests {
             "def456".to_string(),
             "--json".to_string(),
         ];
-        let (spec, format) = parse_diff_args(&args).unwrap();
+        let parsed = parse_diff_args(&args).unwrap();
 
-        match spec {
+        match parsed.spec {
             DiffSpec::TwoCommit(start, end) => {
                 assert_eq!(start, "abc123");
                 assert_eq!(end, "def456");
@@ -1063,7 +1585,34 @@ mod tests {
             _ => panic!("Expected TwoCommit"),
         }
 
-        assert!(matches!(format, DiffFormat::Json));
+        assert!(matches!(parsed.options.format, DiffFormat::Json));
+    }
+
+    #[test]
+    fn test_parse_diff_args_blame_deletions_flags() {
+        let args = vec![
+            "abc123".to_string(),
+            "--blame-deletions".to_string(),
+            "--blame-deletions-since".to_string(),
+            "2 weeks ago".to_string(),
+        ];
+        let parsed = parse_diff_args(&args).unwrap();
+        assert!(parsed.options.blame_deletions);
+        assert_eq!(
+            parsed.options.blame_deletions_since,
+            Some("2 weeks ago".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_diff_args_blame_deletions_since_requires_blame_deletions() {
+        let args = vec![
+            "abc123".to_string(),
+            "--blame-deletions-since".to_string(),
+            "2026-01-01".to_string(),
+        ];
+        let result = parse_diff_args(&args);
+        assert!(result.is_err());
     }
 
     #[test]
