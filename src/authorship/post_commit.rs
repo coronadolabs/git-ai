@@ -134,6 +134,14 @@ pub fn post_commit(
 
     authorship_log.metadata.base_commit_sha = commit_sha.clone();
 
+    // Inject custom attributes into all PromptRecords
+    let custom_attrs = Config::get().custom_attributes();
+    if !custom_attrs.is_empty() {
+        for pr in authorship_log.metadata.prompts.values_mut() {
+            pr.custom_attributes = Some(custom_attrs.clone());
+        }
+    }
+
     // Handle prompts based on effective prompt storage mode for this repository
     // The effective mode considers include/exclude lists and fallback settings
     let effective_storage = Config::get().effective_prompt_storage(&Some(repo.clone()));
@@ -630,6 +638,9 @@ fn record_commit_metrics(
     {
         attrs = attrs.branch(short_branch);
     }
+
+    // Attach custom attributes
+    attrs = attrs.custom_attributes_map(Config::get().custom_attributes());
 
     // Record the metric
     record(values, attrs);
