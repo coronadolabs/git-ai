@@ -94,10 +94,14 @@ pub fn handle_whoami(args: &[String]) {
 }
 
 fn mask_api_key(key: &str) -> String {
-    if key.len() <= 8 {
-        return "*".repeat(key.len());
+fn mask_api_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 8 {
+        return "*".repeat(chars.len());
     }
-    format!("{}...{}", &key[..4], &key[key.len() - 4..])
+    let prefix: String = chars[..4].iter().collect();
+    let suffix: String = chars[chars.len() - 4..].iter().collect();
+    format!("{}...{}", prefix, suffix)
 }
 
 fn print_help() {
