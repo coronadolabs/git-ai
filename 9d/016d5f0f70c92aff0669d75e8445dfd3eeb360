@@ -1,0 +1,23 @@
+install.ps1
+  51a10897ea2cf2de 153,310-311,446-449,507
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.11",
+  "base_commit_sha": "9d016d5f0f70c92aff0669d75e8445dfd3eeb360",
+  "prompts": {
+    "51a10897ea2cf2de": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "681c4132-0519-4f6c-ba0b-04c666b675f5",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "Sergey Kats <skats@neogov.net>",
+      "messages": [],
+      "total_additions": 8,
+      "total_deletions": 6,
+      "accepted_lines": 8,
+      "overriden_lines": 0
+    }
+  }
+}
