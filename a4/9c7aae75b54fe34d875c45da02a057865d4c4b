@@ -1,0 +1,23 @@
+install.ps1
+  b826e365d5bfef3b 217
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.11",
+  "base_commit_sha": "a49c7aae75b54fe34d875c45da02a057865d4c4b",
+  "prompts": {
+    "b826e365d5bfef3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "804753c6-9dae-4e6b-b05c-af346259c28d",
+        "model": "<synthetic>"
+      },
+      "human_author": "Sergey Kats <skats@neogov.net>",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}
