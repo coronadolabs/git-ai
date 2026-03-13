@@ -147,7 +147,20 @@ function Get-StdGitPath {
         }
     }
 
-    # If detection failed or was our own shim, try to recover from saved config
+    # If detection failed or was our own shim, try to recover from saved config in the user's home directory (legacy location)
+    if (-not $gitPath) {
+        try {
+            $cfgPath = Join-Path $HOME "git-ai\config.json"
+            if (Test-Path -LiteralPath $cfgPath) {
+                $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
+                if ($cfg -and $cfg.git_path -and ($cfg.git_path -notmatch 'git-ai') -and (Test-Path -LiteralPath $cfg.git_path)) {
+                    $gitPath = $cfg.git_path
+                }
+            }
+        } catch { }
+    }
+
+    # If detection failed or was our own shim, try to recover from saved config in the Program Files directory (new location)
     if (-not $gitPath) {
         try {
             $cfgPath = Join-Path $env:ProgramFiles "git-ai\config.json"
@@ -201,7 +214,7 @@ function Set-PathPrependBeforeGit {
         $seen = New-Object 'System.Collections.Generic.HashSet[string]'
         foreach ($e in $entries) {
             $n = NormalizePath $e
-            if (-not $seen.Contains($n) -and $n -ne $normalizedAdd) {
+            if (-not $seen.Contains($n) -and $n -ne $normalizedAdd -and $n -notmatch 'git-ai') {
                 $seen.Add($n) | Out-Null
                 $list.Add($e) | Out-Null
             }
