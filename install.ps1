@@ -147,10 +147,23 @@ function Get-StdGitPath {
         }
     }
 
-    # If detection failed or was our own shim, try to recover from saved config
+    # If detection failed or was our own shim, try to recover from saved config in the user's home directory (legacy location)
     if (-not $gitPath) {
         try {
-            $cfgPath = Join-Path $HOME ".git-ai\config.json"
+            $cfgPath = Join-Path $HOME "git-ai\config.json"
+            if (Test-Path -LiteralPath $cfgPath) {
+                $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
+                if ($cfg -and $cfg.git_path -and ($cfg.git_path -notmatch 'git-ai') -and (Test-Path -LiteralPath $cfg.git_path)) {
+                    $gitPath = $cfg.git_path
+                }
+            }
+        } catch { }
+    }
+
+    # If detection failed or was our own shim, try to recover from saved config in the Program Files directory (new location)
+    if (-not $gitPath) {
+        try {
+            $cfgPath = Join-Path $env:ProgramFiles "git-ai\config.json"
             if (Test-Path -LiteralPath $cfgPath) {
                 $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
                 if ($cfg -and $cfg.git_path -and ($cfg.git_path -notmatch 'git-ai') -and (Test-Path -LiteralPath $cfg.git_path)) {
@@ -201,7 +214,7 @@ function Set-PathPrependBeforeGit {
         $seen = New-Object 'System.Collections.Generic.HashSet[string]'
         foreach ($e in $entries) {
             $n = NormalizePath $e
-            if (-not $seen.Contains($n) -and $n -ne $normalizedAdd) {
+            if (-not $seen.Contains($n) -and $n -ne $normalizedAdd -and $n -notmatch 'git-ai') {
                 $seen.Add($n) | Out-Null
                 $list.Add($e) | Out-Null
             }
@@ -307,8 +320,8 @@ if (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_LOCAL_BINARY)) {
     $downloadUrlNoExt = "https://github.com/$Repo/releases/latest/download/$binaryName"
 }
 
-# Install directory: %USERPROFILE%\.git-ai\bin
-$installDir = Join-Path $HOME ".git-ai\bin"
+# Install directory: %ProgramFiles%\git-ai\bin
+$installDir = Join-Path $env:ProgramFiles "git-ai\bin"
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 
 Write-Host ("Downloading git-ai (release: {0})..." -f $releaseTag)
@@ -443,8 +456,10 @@ $gitBashAlreadyConfigured = $false
 try {
     $bashrcPath = Join-Path $HOME '.bashrc'
     $bashProfilePath = Join-Path $HOME '.bash_profile'
-    $pathCmd = 'export PATH="$HOME/.git-ai/bin:$PATH"'
-    $markerString = '.git-ai/bin'
+    $driveLetter = $installDir.Substring(0, 1).ToLower()
+    $msys2InstallDir = '/' + $driveLetter + ($installDir.Substring(2) -replace '\\', '/')
+    $pathCmd = "export PATH=`"$msys2InstallDir`:`$PATH`""
+    $markerString = 'git-ai/bin'
 
     # Detect if Git Bash is installed
     $gitBashInstalled = $false
@@ -502,7 +517,7 @@ if ($gitBashConfigured) {
 
 # Write JSON config at %USERPROFILE%\.git-ai\config.json (only if it doesn't exist)
 try {
-    $configDir = Join-Path $HOME '.git-ai'
+    $configDir = Join-Path $env:ProgramFiles 'git-ai'
     $configJsonPath = Join-Path $configDir 'config.json'
     New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
