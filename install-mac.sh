@@ -300,13 +300,13 @@ success "Successfully installed git-ai into ${INSTALL_DIR}"
 success "You can now run 'git-ai' from your terminal"
 
 # Print installed version
-INSTALLED_VERSION=$(${INSTALL_DIR}/git-ai --version 2>&1 || echo "unknown")
+INSTALLED_VERSION=$(su -l "$CURRENT_USER" -c "'${INSTALL_DIR}/git-ai' --version" 2>&1 || echo "unknown")
 echo "Installed git-ai ${INSTALLED_VERSION}"
 
 # Login user with install token if provided
 NEED_LOGIN=false
 if [ -n "${INSTALL_NONCE:-}" ] && [ -n "${API_BASE:-}" ]; then
-    if ! ${INSTALL_DIR}/git-ai exchange-nonce; then
+    if ! su -l "$CURRENT_USER" -c "INSTALL_NONCE='${INSTALL_NONCE}' API_BASE='${API_BASE}' '${INSTALL_DIR}/git-ai' exchange-nonce"; then
         NEED_LOGIN=true
     fi
 fi
@@ -407,7 +407,7 @@ echo -e "${YELLOW}Close and reopen your terminal and IDE sessions to use git-ai.
 if [ "$NEED_LOGIN" = true ]; then
     echo ""
     echo "Launching login..."
-    ${INSTALL_DIR}/git-ai login
+    su -l "$CURRENT_USER" -c "'${INSTALL_DIR}/git-ai' login"
 fi
 
 # Ensure the developer owns their new git-ai configuration
