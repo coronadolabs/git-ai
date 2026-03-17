@@ -328,6 +328,8 @@ if (-not [string]::IsNullOrWhiteSpace($env:GIT_AI_LOCAL_BINARY)) {
     $downloadUrlNoExt = "https://github.com/$Repo/releases/latest/download/$binaryName"
 }
 
+Write-Host "Downloading from: $downloadUrlExe"
+
 # Install directory: %ProgramFiles%\git-ai\bin
 $installDir = Join-Path $env:ProgramFiles "git-ai\bin"
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null

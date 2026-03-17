@@ -272,6 +272,8 @@ else
     DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}"
 fi
 
+echo "Downloading from: $DOWNLOAD_URL"
+
 # Install into the user's bin directory ~/.git-ai/bin
 INSTALL_DIR="$HOME/.git-ai/bin"
 
