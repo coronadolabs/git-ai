@@ -104,7 +104,7 @@ function Verify-Checksum {
 # When set to __REPO_PLACEHOLDER__, defaults to "git-ai-project/git-ai"
 $Repo = '__REPO_PLACEHOLDER__'
 if ($Repo -eq '__REPO_PLACEHOLDER__') {
-    $Repo = 'git-ai-project/git-ai'
+    $Repo = 'NEOGOV-DEV/git-ai'
 }
 
 # Version placeholder - replaced during release builds with actual version (e.g., "v1.0.24")

@@ -27,7 +27,7 @@ NC='\033[0m' # No Color
 # When set to __REPO_PLACEHOLDER__, defaults to "git-ai-project/git-ai"
 REPO="__REPO_PLACEHOLDER__"
 if [ "$REPO" = "__REPO_PLACEHOLDER__" ]; then
-    REPO="git-ai-project/git-ai"
+    REPO="NEOGOV-DEV/git-ai"
 fi
 
 # Version placeholder - replaced during release builds with actual version (e.g., "v1.0.24")
