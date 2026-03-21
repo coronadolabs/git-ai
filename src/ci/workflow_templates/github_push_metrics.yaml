@@ -1,0 +1,35 @@
+name: Git AI Metrics
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  git-ai-metrics:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch git-ai authorship notes
+        run: |
+          git fetch origin 'refs/notes/*:refs/notes/*' || true
+
+      - name: Install git-ai
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/NEOGOV-DEV/git-ai/refs/heads/main/install.sh | bash
+          echo "$HOME/.git-ai/bin" >> $GITHUB_PATH
+
+      - name: Push AI metrics to OTel
+        env:
+          GIT_AI_OTEL_ENDPOINT: ${{ secrets.GIT_AI_OTEL_ENDPOINT }}
+          GIT_AI_OTEL_BEARER_TOKEN: ${{ secrets.GIT_AI_OTEL_BEARER_TOKEN }}
+        run: |
+          git-ai ci github metrics

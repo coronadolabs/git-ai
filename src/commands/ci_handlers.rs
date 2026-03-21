@@ -1,5 +1,8 @@
 use crate::ci::ci_context::{CiContext, CiEvent, CiRunOptions, CiRunResult};
-use crate::ci::github::{get_github_ci_context, install_github_ci_workflow};
+use crate::ci::github::{
+    get_github_ci_context, install_github_ci_workflow, install_github_push_metrics_workflow,
+    run_github_push_metrics,
+};
 use crate::ci::gitlab::{get_gitlab_ci_context, print_gitlab_ci_yaml};
 use crate::git::repository::find_repository_in_path;
 use crate::utils::debug_log;
@@ -103,6 +106,32 @@ fn handle_ci_github(args: &[String]) {
                 std::process::exit(1);
             }
         },
+        "metrics" => {
+            let sub_args = &args[1..];
+            if sub_args.first().is_some_and(|s| s == "install") {
+                match install_github_push_metrics_workflow() {
+                    Ok(path) => {
+                        println!("Installed push-metrics workflow to {}", path.display());
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to install push-metrics workflow: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                match run_github_push_metrics(sub_args) {
+                    Ok(count) => {
+                        println!("Pushed metrics for {} commit(s).", count);
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("Push metrics failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
         other => {
             eprintln!("Unknown ci github subcommand: {}", other);
             print_ci_help_and_exit();
@@ -328,7 +357,14 @@ fn print_ci_github_help_and_exit() -> ! {
     eprintln!("Subcommands:");
     eprintln!("  run [--no-cleanup]   Run GitHub CI in current repo");
     eprintln!("                       --no-cleanup  Skip teardown after run");
-    eprintln!("  install              Install/update workflow in current repo");
+    eprintln!("  install              Install/update PR-authorship workflow in current repo");
+    eprintln!("  metrics              Push AI stats for commits in a push to OTel");
+    eprintln!("                       --before <sha>        SHA before push (default: GITHUB_BEFORE)");
+    eprintln!("                       --after <sha>         SHA after push  (default: GITHUB_SHA)");
+    eprintln!("                       --branch <name>       Branch name     (default: GITHUB_REF_NAME)");
+    eprintln!("                       --repo-url <url>      Repo URL        (default: GITHUB_SERVER_URL/GITHUB_REPOSITORY)");
+    eprintln!("                       --otel-endpoint <url> OTel base URL   (default: GIT_AI_OTEL_ENDPOINT / config)");
+    eprintln!("  metrics install      Install push-metrics workflow to .github/workflows/git-ai-metrics.yaml");
     std::process::exit(1);
 }
 
